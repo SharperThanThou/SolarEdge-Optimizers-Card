@@ -1,3 +1,5 @@
+<img src="docs/icon.png" alt="" width="128" align="right">
+
 # SolarEdge Optimizers Card
 
 A Home Assistant dashboard card for the
