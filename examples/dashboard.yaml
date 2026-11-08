@@ -1,0 +1,10 @@
+# A complete dashboard view. In Home Assistant: Settings -> Dashboards ->
+# Add dashboard -> New dashboard from scratch, open it, then ⋮ -> Edit
+# dashboard -> ⋮ -> Raw configuration editor, and paste this in.
+views:
+  - title: Solar optimizers
+    path: optimizers
+    icon: mdi:solar-panel
+    type: panel
+    cards:
+      - type: custom:solaredge-optimizers-card

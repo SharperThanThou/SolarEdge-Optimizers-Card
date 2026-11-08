@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Optimizer card demo</title>
+<!--
+  Renders the card outside Home Assistant with made-up data, for development.
+  Open with ?dark to preview the dark theme, ?night for an all-idle site,
+  ?w=358 for a phone-width card.
+-->
+<style>
+  :root {
+    --primary-text-color: #141414; --secondary-text-color: #5f6368; --primary-color: #03a9f4;
+    --card-background-color: #ffffff; --secondary-background-color: #f2f3f5; --divider-color: #e0e0e0;
+  }
+  :root.dark {
+    --primary-text-color: #e1e1e1; --secondary-text-color: #9b9b9b; --primary-color: #03a9f4;
+    --card-background-color: #1c1c1c; --secondary-background-color: #2b2b2b; --divider-color: #333;
+  }
+  body { margin: 0; padding: 24px 16px; background: #fafafa; font-family: Roboto, system-ui, sans-serif; }
+  :root.dark body { background: #111111; }
+  main { max-width: 980px; margin: 0 auto; }
+</style>
+</head>
+<body>
+<main id="host"></main>
+<script>
+  // Minimal stand-ins for Home Assistant's own elements.
+  customElements.define("ha-card", class extends HTMLElement {
+    connectedCallback() {
+      Object.assign(this.style, { display: "block", background: "var(--card-background-color)", borderRadius: "12px",
+        border: "1px solid var(--divider-color)" });
+    }
+  });
+  const GLYPHS = { "mdi:alert-circle": "!", "mdi:check-circle": "✓", "mdi:solar-power-variant-outline": "↓",
+    "mdi:power-plug-off-outline": "×", "mdi:access-point-network-off": "⌀", "mdi:shield-alert-outline": "S" };
+  customElements.define("ha-icon", class extends HTMLElement {
+    connectedCallback() {
+      this.textContent = GLYPHS[this.getAttribute("icon")] || "•";
+      Object.assign(this.style, { fontWeight: "700", fontSize: "var(--mdc-icon-size, 18px)", lineHeight: "1",
+        display: "inline-flex", width: "var(--mdc-icon-size, 18px)", justifyContent: "center" });
+    }
+  });
+</script>
+<script src="../solaredge-optimizers-card.js"></script>
+<script>
+  const params = new URLSearchParams(location.search);
+  const dark = params.has("dark");
+  const night = params.has("night");
+  if (dark) document.documentElement.classList.add("dark");
+  if (params.get("w")) document.getElementById("host").style.maxWidth = `${params.get("w")}px`;
+
+  const entities = {}, devices = {}, states = {};
+  const now = new Date();
+  const iso = (d) => d.toISOString();
+  devices.site = { name: "SolarEdge site 1234567" };
+  devices.inv = { name: "Inverter 7E1A2B3C", via_device_id: "site" };
+  const add = (id, device, key, state, attributes = {}) => {
+    entities[id] = { entity_id: id, platform: "solaredge_optimizers", device_id: device, translation_key: key };
+    states[id] = { entity_id: id, state: String(state), attributes, last_updated: iso(now) };
+  };
+  add("binary_sensor.site_problem", "site", "any_optimizer_problem", "on");
+  add("sensor.site_unhealthy", "site", "unhealthy_optimizers", 3);
+
+  const problems = { "1.0.7": ["low_output", 0.42], "1.1.15": ["no_output", 0.0], "1.1.3": ["not_reporting", null] };
+  const strings = [["1.0", 22], ["1.1", 22]];
+  let seed = 4;
+  const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  for (const [string, count] of strings) {
+    for (let n = 1; n <= count; n += 1) {
+      const name = `${string}.${n}`;
+      const dev = `opt_${name}`;
+      devices[dev] = { name: `Optimizer ${name}`, via_device_id: "inv" };
+      const base = string === "1.0" ? 300 : 255;
+      let factor = 0.9 + rand() * 0.2;
+      let status = night ? "unknown" : "ok";
+      let reported = new Date(now - 6 * 60000);
+      if (!night && problems[name]) {
+        status = problems[name][0];
+        factor = problems[name][1] ?? 0;
+        if (status === "not_reporting") reported = new Date(now - 3.2 * 3600000);
+      }
+      const watts = night ? 0 : base * factor;
+      const slug = `optimizer_${name.replaceAll(".", "_")}`;
+      add(`sensor.${slug}_health`, dev, "health", status, { string, candidate: status });
+      add(`sensor.${slug}_power`, dev, undefined, watts.toFixed(1), { device_class: "power", unit_of_measurement: "W" });
+      add(`sensor.${slug}_output_vs_peers`, dev, "peer_ratio", night || status === "not_reporting" ? "unknown" : (factor * 100).toFixed(1));
+      add(`sensor.${slug}_module_voltage`, dev, "module_voltage", night ? "0" : (36 + rand() * 4).toFixed(1));
+      add(`sensor.${slug}_last_measurement`, dev, "last_measurement", iso(reported));
+    }
+  }
+
+  // Fake history: a sunny-day bell curve per optimizer, sampled every 15 min.
+  async function callWS(msg) {
+    const out = {};
+    const start = new Date(msg.start_time).getTime();
+    const end = new Date(msg.end_time).getTime();
+    msg.entity_ids.forEach((id, i) => {
+      const scale = parseFloat(states[id].state) > 0 ? 1 : (i % 5 === 0 ? 0.4 : 1);
+      const rows = [];
+      for (let t = start; t <= end; t += 15 * 60000) {
+        const h = new Date(t).getHours() + new Date(t).getMinutes() / 60;
+        const sun = Math.max(0, Math.sin(((h - 6.5) / 11) * Math.PI));
+        const cloud = h > 13 && h < 14 ? 0.55 : 1;
+        rows.push({ s: (330 * sun * cloud * scale * (0.95 + rand() * 0.1)).toFixed(1), lu: t / 1000 });
+      }
+      out[id] = rows;
+    });
+    return out;
+  }
+
+  const card = document.createElement("solaredge-optimizers-card");
+  card.setConfig({});
+  document.getElementById("host").append(card);
+  card.hass = {
+    entities, devices, states, callWS, themes: { darkMode: dark },
+    formatEntityState: (s) => ({ ok: "OK", low_output: "Low output", no_output: "No output",
+      not_reporting: "Not reporting", safe_mode: "Stuck in safe mode", unknown: "Unknown" })[s.state] ?? s.state,
+  };
+  card.addEventListener("hass-more-info", (ev) => console.log("more-info", ev.detail.entityId));
+</script>
+</body>
+</html>
