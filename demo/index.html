@@ -7,8 +7,9 @@
 <!--
   Renders the card outside Home Assistant with made-up data, for development.
   Open with ?dark to preview the dark theme, ?night for an all-idle site,
-  ?w=358 for a phone-width card.
+  ?w=358 for a phone-width card, ?lcars for the LCARS style.
 -->
+<link rel="preconnect" href="https://fonts.gstatic.com">
 <style>
   :root {
     --primary-text-color: #141414; --secondary-text-color: #5f6368; --primary-color: #03a9f4;
@@ -111,7 +112,7 @@
   }
 
   const card = document.createElement("solaredge-optimizers-card");
-  card.setConfig({});
+  card.setConfig(params.has("lcars") ? { style: "lcars" } : {});
   document.getElementById("host").append(card);
   card.hass = {
     entities, devices, states, callWS, themes: { darkMode: dark },

@@ -18,6 +18,21 @@ const BUCKET_MS = 5 * 60 * 1000;
 // runs dark -> light so low output always recedes towards the card surface.
 const RAMP_LIGHT = ["#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#104281"];
 const RAMP_DARK = ["#16263d", "#104281", "#184f95", "#256abf", "#2a78d6", "#5598e7", "#86b6ef"];
+// The LCARS style sits on black, so it also runs dark -> light.
+const RAMP_LCARS = ["#1c2340", "#2b3a7a", "#3f55b0", "#5a73d6", "#7d93f0", "#99aaff", "#c4ceff"];
+
+const LCARS = { orange: "#ff9c3c", peach: "#ffcc99", lavender: "#cc99cc", violet: "#9977dd", blue: "#99aaff", tan: "#dd9966" };
+const TONE = { good: "#0ca30c", serious: "#ec835a", critical: "#d03b3b" };
+const FONT_URL = "https://fonts.googleapis.com/css2?family=Antonio:wght@400;700&display=swap";
+
+function loadLcarsFont() {
+  if (document.getElementById("solaredge-optimizers-card-font")) return;
+  const link = document.createElement("link");
+  link.id = "solaredge-optimizers-card-font";
+  link.rel = "stylesheet";
+  link.href = FONT_URL;
+  document.head.append(link);
+}
 
 const STATUS = {
   ok: { tone: "good", icon: "mdi:check-circle-outline", label: "OK", problem: false },
@@ -106,6 +121,8 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       title: "Solar optimizers",
       show_history: true,
       show_weakest: 5,
+      style: "default",
+      lcars_font: true,
       ...config,
     };
     this._signature = null;
@@ -327,10 +344,14 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     if (!this._hass || !this._config) return;
     const model = this._model();
     const dark = Boolean(this._hass.themes?.darkMode);
-    const ramp = dark ? RAMP_DARK : RAMP_LIGHT;
+    const lcars = this._config.style === "lcars";
+    this._lcars = lcars;
+    const ramp = lcars ? RAMP_LCARS : dark ? RAMP_DARK : RAMP_LIGHT;
+    if (lcars && this._config.lcars_font) loadLcarsFont();
 
     if (!this._shell) {
       this.shadowRoot.innerHTML = `<style>${STYLES}</style><ha-card><div class="body"></div><div class="tip" role="tooltip"></div></ha-card>`;
+      this._card = this.shadowRoot.querySelector("ha-card");
       this._shell = this.shadowRoot.querySelector(".body");
       this._tip = this.shadowRoot.querySelector(".tip");
       this._shell.addEventListener("pointerover", (ev) => this._hover(ev));
@@ -342,6 +363,8 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       });
     }
     this._items = model.items;
+    this._card.classList.toggle("lcars", lcars);
+    this._shell.classList.toggle("narrow", Boolean(this._width) && this._width < 520);
 
     if (!model.items.length) {
       this._shell.innerHTML = `<div class="empty">No optimizers found. Install and set up the
@@ -350,20 +373,62 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       return;
     }
 
+    if (lcars) {
+      this._shell.innerHTML = this._renderLcars(model, ramp);
+      return;
+    }
+    const stroke = dark ? "#3987e5" : "#2a78d6";
     this._shell.innerHTML = [
       this._config.title ? `<h1 class="title">${esc(this._config.title)}</h1>` : "",
       this._renderStats(model),
-      this._config.show_history ? this._renderHistory(dark) : "",
+      this._config.show_history ? this._renderHistory(stroke, this._width - 32) : "",
       this._renderMap(model, ramp),
       this._renderWeakest(model, ramp),
     ].join("");
   }
 
-  _renderStats({ items, latest }) {
-    const total = items.reduce((sum, i) => sum + (i.watts || 0), 0);
-    const producing = items.filter((i) => (i.watts || 0) > 0).length;
+  _summary({ items, latest }) {
     const problems = items.filter((i) => STATUS[i.status].problem);
-    const problemTone = problems.length ? (problems.some((p) => STATUS[p.status].tone === "critical") ? "critical" : "serious") : "good";
+    return {
+      total: items.reduce((sum, i) => sum + (i.watts || 0), 0),
+      producing: items.filter((i) => (i.watts || 0) > 0).length,
+      problems,
+      tone: problems.length ? (problems.some((p) => STATUS[p.status].tone === "critical") ? "critical" : "serious") : "good",
+      latest,
+    };
+  }
+
+  _renderLcars(model, ramp) {
+    const sum = this._summary(model);
+    const side = this._width && this._width < 520 ? 70 : 124;
+    const alert = sum.problems.length ? `background:${TONE[sum.tone]}` : `background:${LCARS.blue}`;
+    const block = (label, value, style, cls = "") =>
+      `<div class="lc-block ${cls}" style="${style}"><span class="lc-label">${label}</span><span class="lc-value">${value}</span></div>`;
+    return `<div class="lc" style="--side:${side}px">
+      <div class="lc-corner"></div>
+      <div class="lc-top"><span class="lc-bar"></span>${this._config.title ? `<h1 class="lc-title">${esc(this._config.title)}</h1>` : ""}<span class="lc-cap"></span></div>
+      <div class="lc-side">
+        ${block("Output", formatPower(sum.total), `background:${LCARS.lavender}`)}
+        ${block("Producing", `${sum.producing}/${model.items.length}`, `background:${LCARS.peach}`)}
+        ${block("Problems", sum.problems.length, alert, sum.tone === "critical" ? "alert" : "")}
+        ${block("Last report", relativeTime(sum.latest), `background:${LCARS.tan}`, "small")}
+        <div class="lc-block lc-fill" style="background:${LCARS.violet}"></div>
+      </div>
+      <div class="lc-main">
+        ${this._config.show_history ? this._renderHistory(LCARS.orange, this._width - side - 46) : ""}
+        ${this._renderMap(model, ramp)}
+        ${this._renderWeakest(model, ramp)}
+      </div>
+      <div class="lc-corner-b"></div>
+      <div class="lc-bottom"><span class="lc-bar"></span>
+        <span class="lc-code">${model.items.length} optimizers · ${model.strings.length} ${model.strings.length === 1 ? "string" : "strings"}</span>
+        <span class="lc-cap"></span></div>
+    </div>`;
+  }
+
+  _renderStats(model) {
+    const { total, producing, problems, tone: problemTone, latest } = this._summary(model);
+    const { items } = model;
     return `<div class="stats">
       <div class="stat"><div class="label">Output now</div><div class="value">${formatPower(total)}</div></div>
       <div class="stat"><div class="label">Producing</div><div class="value">${producing}<span class="of"> / ${items.length}</span></div></div>
@@ -380,7 +445,8 @@ class SolarEdgeOptimizersCard extends HTMLElement {
         const index = this._items.indexOf(item);
         const status = STATUS[item.status];
         const lit = item.watts && item.watts > 0;
-        const fill = lit ? rampColor(ramp, item.watts / (max || 1)) : null;
+        let fill = lit ? rampColor(ramp, item.watts / (max || 1)) : null;
+        if (this._lcars && status.problem) fill = TONE[status.tone];
         const ink = fill ? (isLight(fill) ? "#0b0b0b" : "#ffffff") : null;
         const style = fill ? `background:${fill};color:${ink}` : "";
         const badge = status.problem
@@ -397,7 +463,7 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       });
       return `<section class="string">
         <div class="string-head"><span>${esc(name === "Unassigned" ? (strings.length > 1 ? "Not in a string" : "Optimizers") : /^string/i.test(name) ? name : `String ${name}`)}</span>
-          <span class="muted">${list.length} · ${formatPower(total)}</span></div>
+          <span class="rule"></span><span class="muted">${list.length} · ${formatPower(total)}</span></div>
         <div class="grid">${tiles.join("")}</div>
       </section>`;
     });
@@ -428,18 +494,18 @@ class SolarEdgeOptimizersCard extends HTMLElement {
         <span class="track"><span class="fill" style="width:${width}%;background:${ramp[4]}"></span>
           <span class="ref" style="left:${(100 / scaleMax) * 100}%"></span></span>
         <span class="row-val">${Math.round(item.ratio)}%</span>
-        <span class="row-status">${status.problem ? `<ha-icon class="tone-${status.tone}" icon="${status.icon}"></ha-icon>${esc(item.statusLabel)}` : ""}</span>
+        <span class="row-status">${status.problem ? `<ha-icon class="tone-${status.tone}" icon="${status.icon}"></ha-icon><span class="row-label">${esc(item.statusLabel)}</span>` : ""}</span>
       </div>`;
     });
     return `${head}<div class="rows">${rows.join("")}</div>
       <p class="muted note">The tick marks 100%, the median of each optimizer's string.</p>`;
   }
 
-  _renderHistory(dark) {
+  _renderHistory(stroke, available) {
     const head = `<h2 class="sub">Optimizer output today</h2>`;
     const points = this._history;
     if (!points) return `${head}<div class="chart placeholder muted">Loading history…</div>`;
-    const width = Math.max(this._width - 32, 240);
+    const width = Math.max(available || 0, 220);
     const height = 140;
     const pad = { l: 44, r: 8, t: 8, b: 22 };
     const innerW = width - pad.l - pad.r;
@@ -453,7 +519,6 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     const y = (v) => pad.t + innerH - (v / yMax) * innerH;
     const line = points.map((p, i) => `${i ? "L" : "M"}${x(p.t).toFixed(1)},${y(p.v).toFixed(1)}`).join("");
     const area = `${line}L${x(points.at(-1).t).toFixed(1)},${y(0)}L${x(points[0].t).toFixed(1)},${y(0)}Z`;
-    const stroke = dark ? "#3987e5" : "#2a78d6";
     const grid = [0, 0.5, 1]
       .map((f) => `<line x1="${pad.l}" x2="${width - pad.r}" y1="${y(yMax * f)}" y2="${y(yMax * f)}" class="${f ? "gridline" : "baseline"}"/>
         <text x="${pad.l - 6}" y="${y(yMax * f) + 4}" text-anchor="end" class="axis">${formatPower(yMax * f)}</text>`)
@@ -637,6 +702,85 @@ const STYLES = `
   .tip-row span:first-child { color: var(--secondary-text-color); }
   .tip-row span:last-child { display: inline-flex; align-items: center; gap: 4px; font-variant-numeric: tabular-nums; }
   .tip ha-icon { --mdc-icon-size: 14px; }
+  .rule { display: none; }
+  .narrow .row { grid-template-columns: minmax(40px, auto) 1fr 40px 18px; }
+  .narrow .row-label { display: none; }
+  .narrow .lc-title { font-size: 1.35rem; margin-top: -1px; }
+  .narrow .lc-top .lc-cap, .narrow .lc-bottom .lc-cap { width: 24px; }
+  .narrow .lc-block { min-height: 54px; padding: 4px 6px; }
+  .narrow .lc-value { font-size: 1.15rem; }
+  .narrow .lc-block.small .lc-value { font-size: 0.85rem; }
+  .narrow .lc-main { padding-left: 12px; }
+  .narrow .lc-code { font-size: 0.7rem; }
+
+  /* ----- LCARS style ----------------------------------------------------- */
+  ha-card.lcars {
+    --lc-orange: #ff9c3c; --lc-peach: #ffcc99; --lc-lavender: #cc99cc; --lc-violet: #9977dd; --lc-blue: #99aaff;
+    --primary-text-color: var(--lc-peach); --secondary-text-color: var(--lc-lavender);
+    --secondary-background-color: #14182c; --divider-color: #2a2f4d; --card-background-color: #000;
+    --ha-card-background: #000;
+    background: #000; color: var(--lc-peach); border: none;
+    font-family: Antonio, "Arial Narrow", "Roboto Condensed", sans-serif;
+    text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  .lcars .body { padding: 12px; }
+  .lc { display: grid; grid-template-columns: var(--side) minmax(0, 1fr); grid-template-rows: 52px auto 34px; }
+  .lc-corner { background: var(--lc-orange); border-top-left-radius: 48px 40px; }
+  .lc-corner-b { background: var(--lc-orange); border-bottom-left-radius: 48px 34px; }
+  .lc-top, .lc-bottom { position: relative; display: flex; gap: 6px; min-width: 0; }
+  .lc-top { align-items: flex-start; }
+  .lc-bottom { align-items: flex-end; }
+  .lc-top .lc-bar { height: 22px; flex: 1 1 24px; background: var(--lc-orange); }
+  .lc-bottom .lc-bar { height: 14px; flex: 1 1 24px; background: var(--lc-orange); }
+  .lc-top::before, .lc-bottom::before { content: ""; position: absolute; left: 0; width: 26px; height: 26px; }
+  .lc-top::before { top: 22px; background: radial-gradient(circle at 100% 100%, transparent 25.5px, var(--lc-orange) 26px); }
+  .lc-bottom::before { bottom: 14px; background: radial-gradient(circle at 100% 0, transparent 25.5px, var(--lc-orange) 26px); }
+  .lc-title { margin: -5px 0 0; padding: 0 4px; font-size: 2rem; line-height: 1; font-weight: 400; color: var(--lc-orange);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .lc-top .lc-cap { width: 44px; height: 22px; flex: none; background: var(--lc-lavender); border-radius: 0 11px 11px 0; }
+  .lc-bottom .lc-cap { width: 44px; height: 14px; flex: none; background: var(--lc-blue); border-radius: 0 7px 7px 0; }
+  .lc-code { font-size: 0.8rem; line-height: 1; color: var(--lc-lavender); white-space: nowrap; margin-bottom: -2px; }
+  .lc-side { display: flex; flex-direction: column; gap: 4px; padding: 4px 0; }
+  .lc-block { display: flex; flex-direction: column; align-items: flex-end; justify-content: flex-end; min-height: 62px;
+    padding: 4px 8px; color: #000; box-sizing: border-box; }
+  .lc-label { font-size: 0.7rem; line-height: 1.1; text-align: right; }
+  .lc-value { font-size: 1.6rem; line-height: 1.05; font-weight: 700; text-align: right; }
+  .lc-block.small .lc-value { font-size: 1.05rem; }
+  .lc-fill { flex: 1; min-height: 24px; }
+  .lc-main { padding: 6px 2px 10px 18px; min-width: 0; }
+
+  .lcars .sub, .lcars .string-head { display: flex; align-items: center; gap: 8px; font-weight: 400; }
+  .lcars .sub { margin: 14px 0 8px; font-size: 1.05rem; color: var(--lc-orange); }
+  .lcars .lc-main > .sub:first-child { margin-top: 2px; }
+  .lcars .sub::after { content: ""; flex: 1; height: 10px; border-radius: 5px; background: var(--lc-violet); }
+  .lcars .string-head { justify-content: flex-start; font-size: 0.95rem; color: var(--lc-peach); }
+  .lcars .string-head .rule { display: block; flex: 1; height: 6px; border-radius: 3px; background: var(--lc-blue); opacity: 0.8; }
+  .lcars .map { margin-top: 16px; }
+
+  .lcars .grid { grid-template-columns: repeat(auto-fill, minmax(74px, 1fr)); gap: 6px; }
+  .lcars .tile { aspect-ratio: auto; min-height: 46px; border-radius: 23px; padding: 3px 14px 4px 8px;
+    align-items: flex-end; justify-content: flex-end; background-image: none; background-color: #14182c; color: var(--lc-lavender); }
+  .lcars .tile .name { font-size: 0.72rem; line-height: 1; }
+  .lcars .tile .watts { font-size: 1.1rem; line-height: 1.05; font-weight: 700; }
+  .lcars .tile .state { font-size: 0.66rem; font-weight: 700; line-height: 1.05; text-align: right; overflow-wrap: anywhere; }
+  .lcars .tile.problem { box-shadow: none; color: #000 !important; }
+  .lcars .tile.problem .watts, .lcars .tile .badge { display: none; }
+  .lcars .tile:hover, .lcars .tile:focus-visible { box-shadow: 0 0 0 2px var(--lc-peach); }
+  .lcars .tile.ring-critical, .lcars .lc-block.alert { animation: lc-alert 1.6s ease-in-out infinite; }
+  @keyframes lc-alert { 50% { filter: brightness(0.75) saturate(1.3); } }
+  @media (prefers-reduced-motion: reduce) {
+    .lcars .tile.ring-critical, .lcars .lc-block.alert { animation: none; }
+  }
+
+  .lcars .legend { font-size: 0.75rem; }
+  .lcars .row { font-size: 0.9rem; }
+  .lcars .track .fill { border-radius: 0 5px 5px 0; }
+  .lcars .track .ref { background: var(--lc-orange); opacity: 1; }
+  .lcars .note, .lcars .muted { color: var(--lc-lavender); }
+  .lcars .axis { font-size: 11px; letter-spacing: 0.04em; }
+  .lcars .tip { background: #000; border: 2px solid var(--lc-orange); border-radius: 0 14px 14px 0; box-shadow: none; }
+  .lcars .tip strong { color: var(--lc-orange); font-weight: 400; }
+  .lcars .chart.placeholder { color: var(--lc-lavender); }
 `;
 
 customElements.define("solaredge-optimizers-card", SolarEdgeOptimizersCard);

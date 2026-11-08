@@ -1,3 +1,5 @@
+<img src="docs/icon.png" alt="" width="128" align="right">
+
 # SolarEdge Optimizers Card
 
 A Home Assistant dashboard card for the
@@ -18,6 +20,12 @@ Hover over a tile or bar for its details, and click it to open the
 optimizer's health entity.
 
 ![The card with made-up data](docs/screenshot.png)
+
+There's also an LCARS-inspired style (`style: lcars`), with an elbow frame,
+sidebar readouts, pill-shaped optimizer buttons and a red-alert pulse on
+faults:
+
+![The LCARS style with made-up data](docs/screenshot-lcars.png)
 
 The card needs no setup. It finds the optimizers through the integration, so
 renamed entities, and optimizers added later, are picked up automatically.
@@ -59,6 +67,8 @@ It's a single-card *panel* view, so the map uses the full width.
 | Option | Default | Description |
 | --- | --- | --- |
 | `title` | `Solar optimizers` | Card title. Set to `""` to hide it. |
+| `style` | `default` | `default` follows your Home Assistant theme. `lcars` uses the LCARS-inspired black panel. |
+| `lcars_font` | `true` | With `style: lcars`, load the Antonio typeface from Google Fonts. Set to `false` to make no external request; a condensed system font is used instead. |
 | `show_history` | `true` | Show today's total output chart. |
 | `show_weakest` | `5` | How many optimizers to list under *Lowest output vs peers*. `0` hides the list. |
 | `max_power` | (highest current output) | Fix the power that gets the darkest shade, e.g. your optimizers' rated power. By default the shading is relative to the best optimizer right now. |
@@ -76,7 +86,10 @@ installed.
 
 The map's shading uses a single blue scale. Problems use orange (low output)
 and red (no output, not reporting, stuck in safe mode), and always come with
-an icon and a label, so they don't rely on colour alone.
+an icon and a label, so they don't rely on colour alone. The LCARS style
+keeps the same meaning: blue shading for power, orange and red buttons for
+problems, with the problem written on the button. Its red-alert pulse stops
+if your device is set to reduce motion.
 
 ## Development
 
@@ -86,7 +99,8 @@ The card is a single JavaScript file with no build step and no dependencies.
 ```bash
 python3 -m http.server
 # then open http://localhost:8000/demo/
-# ?dark for the dark theme, ?night for an idle site, ?w=358 for phone width
+# ?dark for the dark theme, ?night for an idle site, ?w=358 for phone width,
+# ?lcars for the LCARS style (combine with &)
 ```
 
 ## License
