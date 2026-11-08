@@ -8,3 +8,5 @@ views:
     type: panel
     cards:
       - type: custom:solaredge-optimizers-card
+        # Remove this line for a card that follows your Home Assistant theme.
+        style: lcars
