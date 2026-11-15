@@ -120,6 +120,18 @@ function energyWh(state) {
   return unit === "kWh" ? value * 1000 : unit === "MWh" ? value * 1e6 : value;
 }
 
+/**
+ * The AC rating in W encoded in a SolarEdge inverter model, such as
+ * SE11400H-US -> 11400 or SE10K-RWS -> 10000. Null if it can't be read.
+ */
+function inverterRating(model) {
+  const match = /SE\s?-?(\d+(?:[.,]\d+)?)\s*(K)?/i.exec(model || "");
+  if (!match) return null;
+  const value = parseFloat(match[1].replace(",", "."));
+  if (match[2]) return value * 1000;
+  return value >= 1000 ? value : null;
+}
+
 const pct = (value) => (value === null || value === undefined || !Number.isFinite(value) ? "–" : `${Math.round(value)}%`);
 
 // "25.0 kWh" -> "25.0<small> kWh</small>", for big figures.
@@ -301,6 +313,7 @@ class SolarEdgeOptimizersCard extends HTMLElement {
         ratio: find("peer_ratio"),
         voltage: find("module_voltage"),
         last: find("last_measurement"),
+        inverterId: this._hass.devices?.[deviceId]?.via_device_id || null,
       });
     }
     optimizers.sort((a, b) => naturalCompare(a.name, b.name));
@@ -538,6 +551,7 @@ class SolarEdgeOptimizersCard extends HTMLElement {
         return {
           name,
           list,
+          inverterId: list[0]?.inverterId || null,
           watts: list.reduce((sum, i) => sum + (i.watts || 0), 0),
           energy: ready ? list.reduce((sum, i) => sum + (i.energy || 0), 0) : null,
           peak: totals.size ? Math.max(...totals.values()) : null,
@@ -584,20 +598,78 @@ class SolarEdgeOptimizersCard extends HTMLElement {
 
   _forecastModel(plan, { today, day, stats, ready, strings, energy }) {
     const states = this._hass.states;
+    const now = Date.now();
     const dayStart = day.getTime();
     const dayEnd = addDays(day, 1).getTime();
+    const solar = stats?.solar;
+    // The full curve for today, if the Energy dashboard offers it.
+    const full = Boolean(today && solar && plan.site.every((id) => solar[id]?.wh_hours));
+    const step = full || stats?.period === "hour" ? 3600000 : 300000;
+
+    // Each entry's forecast through the day: period start -> mean W.
+    const series = new Map();
+    for (const id of plan.site) {
+      const points = new Map();
+      if (full) {
+        // Hourly energy in Wh is also the hour's mean power in W.
+        for (const [iso, wh] of Object.entries(solar[id].wh_hours)) {
+          const t = Date.parse(iso);
+          if (t >= dayStart && t < dayEnd) points.set(t, wh);
+        }
+      } else if (ready) {
+        const power = this._forecasts.get(id)?.power;
+        for (const [t, v] of stats.perEntity.get(power)?.series || []) points.set(t, v);
+      }
+      series.set(id, points);
+    }
+
+    // Each Forecast.Solar entry only knows its own panels, but strings on one
+    // inverter share its AC limit. Cap their combined forecast at that limit
+    // and scale each entry down in proportion.
+    const groups = this._inverterGroups(plan, strings);
+    const capped = new Map(plan.site.map((id) => [id, new Map(series.get(id))]));
+    let clipping = false;
+    for (const group of groups) {
+      if (!group.limit) continue;
+      const times = new Set(group.ids.flatMap((id) => [...series.get(id).keys()]));
+      for (const t of times) {
+        const sum = group.ids.reduce((acc, id) => acc + (series.get(id).get(t) || 0), 0);
+        if (sum <= group.limit) continue;
+        clipping = true;
+        const factor = group.limit / sum;
+        for (const id of group.ids) {
+          const v = series.get(id).get(t);
+          if (v !== undefined) capped.get(id).set(t, v * factor);
+        }
+      }
+    }
+    const integrate = (points, until = Infinity) => {
+      let wh = 0;
+      for (const [t, v] of points) {
+        if (t >= until) continue;
+        wh += (v * (Math.min(t + step, until) - t)) / 3600000;
+      }
+      return wh;
+    };
+
     const figures = (entryId) => {
       const f = this._forecasts.get(entryId);
       if (!f) return null;
+      const raw = series.get(entryId);
+      const cap = capped.get(entryId);
+      if (today && full) return { total: integrate(cap), expected: integrate(cap, now) };
       if (today) {
+        // The sensors give the uncapped day; take off what the cap removed
+        // from the part of today that's been recorded.
         const total = energyWh(states[f.today]);
         const remaining = energyWh(states[f.remaining]);
-        return { total, expected: total !== null && remaining !== null ? Math.max(total - remaining, 0) : null };
+        if (total === null) return { total: null, expected: null };
+        const lost = integrate(raw, now) - integrate(cap, now);
+        return { total: total - lost, expected: remaining === null ? null : Math.max(total - remaining - lost, 0) };
       }
       // Earlier days: add up the recorded forecast power, the same way
       // actual energy is worked out.
-      const stat = ready ? stats.perEntity.get(f.power) : undefined;
-      return { total: ready && stat ? stat.energy : null, expected: null };
+      return { total: ready && raw.size ? integrate(cap) : null, expected: null };
     };
     const combine = (ids) => {
       const figs = ids.map(figures).filter(Boolean);
@@ -620,33 +692,62 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       group.forecastTitle = id ? this._forecastTitles?.get(id) : null;
     }
 
-    let curve = null;
-    const solar = stats?.solar;
-    if (today && solar && plan.site.every((id) => solar[id]?.wh_hours)) {
-      const totals = new Map();
-      for (const id of plan.site) {
-        for (const [iso, wh] of Object.entries(solar[id].wh_hours)) {
-          const t = Date.parse(iso);
-          if (t >= dayStart && t < dayEnd) totals.set(t, (totals.get(t) || 0) + wh);
-        }
+    const totals = new Map();
+    for (const id of plan.site) for (const [t, v] of capped.get(id)) totals.set(t, (totals.get(t) || 0) + v);
+    const curve = totals.size
+      ? { points: [...totals.entries()].sort((a, b) => a[0] - b[0]).map(([t, v]) => ({ t, v })), step, full }
+      : null;
+    const limited = groups.filter((g) => g.limit);
+    return {
+      site,
+      curve,
+      groups,
+      clipping,
+      // Without the full curve, today's cap only covers what's been recorded.
+      partialCap: today && !full && limited.length > 0,
+      limit: limited.length === 1 && groups.length === 1 ? limited[0].limit : null,
+    };
+  }
+
+  /** Forecast entries grouped by the inverter their strings are wired to. */
+  _inverterGroups(plan, strings) {
+    const override = this._config.inverter_power;
+    const limitFor = (inverterId) => {
+      const device = this._hass.devices?.[inverterId];
+      const name = device?.name_by_user || device?.name || "Inverter";
+      if (override && typeof override === "object") {
+        const value = Number(override[name] ?? override[inverterId]);
+        if (value > 0) return { name, limit: value, source: "setting" };
+      } else if (Number(override) > 0) {
+        return { name, limit: Number(override), source: "setting" };
       }
-      // Hourly energy in Wh is also the hour's mean power in W.
-      curve = { points: [...totals.entries()].sort((a, b) => a[0] - b[0]).map(([t, v]) => ({ t, v })), step: 3600000, full: true };
-    } else if (ready) {
-      const totals = new Map();
-      for (const id of plan.site) {
-        const power = this._forecasts.get(id)?.power;
-        for (const [t, v] of stats.perEntity.get(power)?.series || []) totals.set(t, (totals.get(t) || 0) + v);
+      const rating = inverterRating(device?.model);
+      return { name, limit: rating, source: rating ? device.model : null };
+    };
+    const groups = new Map();
+    const add = (inverterId, entryId) => {
+      if (!groups.has(inverterId)) groups.set(inverterId, { inverterId, ...limitFor(inverterId), ids: [] });
+      groups.get(inverterId).ids.push(entryId);
+    };
+    if (plan.byString.size) {
+      const placed = new Set();
+      for (const group of strings) {
+        const id = plan.byString.get(group.name);
+        if (!id || placed.has(id)) continue;
+        placed.add(id);
+        add(group.inverterId || "unknown", id);
       }
-      if (totals.size) {
-        curve = {
-          points: [...totals.entries()].sort((a, b) => a[0] - b[0]).map(([t, v]) => ({ t, v })),
-          step: stats.period === "hour" ? 3600000 : 300000,
-          full: false,
-        };
-      }
+      return [...groups.values()];
     }
-    return { site, curve };
+    // No mapping: every entry is assumed to cover the whole site.
+    const inverters = [...new Set(strings.map((g) => g.inverterId).filter(Boolean))];
+    if (inverters.length === 1) {
+      for (const id of plan.site) add(inverters[0], id);
+      return [...groups.values()];
+    }
+    const parts = inverters.map(limitFor);
+    const limit = parts.length && parts.every((p) => p.limit) ? parts.reduce((sum, p) => sum + p.limit, 0) : null;
+    return [{ inverterId: "all", name: "All inverters", limit, source: limit ? "combined" : null, ids: [...plan.site] }];
   }
 
   _render() {
@@ -782,6 +883,25 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       : `<p>No strings are matched to a forecast yet, so the site forecast adds up all ${model.plan.site.length}
          Forecast.Solar ${model.plan.site.length === 1 ? "entry" : "entries"}. Match each string in this card's settings
          to see a forecast per string.</p>`;
+    const watts = (w) => `${Math.round(w).toLocaleString()} W`;
+    const groups = model.forecast?.groups || [];
+    const limitText = groups
+      .map((g) => {
+        if (!g.limit) {
+          return `<p>${esc(g.name)}: its AC rating couldn't be read from its model, so the forecast isn't capped. Set
+            <em>Inverter AC limit</em> in this card's settings if the panels can produce more than the inverter.</p>`;
+        }
+        const from = g.source === "setting" ? "from this card's settings"
+          : g.source === "combined" ? "the inverters' ratings added up" : `read from its model, ${esc(g.source)}`;
+        return `<p>Capped at ${esc(g.name)}'s ${watts(g.limit)} (${from}): the panels on it can't deliver more than
+          the inverter, so their combined forecast is limited to that and each string's share is scaled down to match.</p>`;
+      })
+      .join("");
+    const partial = model.forecast?.partialCap
+      ? `<p>Today the cap only covers the part of the day already recorded, so today's forecast total can be a little
+         high on days the inverter limits output. Linking the entries in the Energy dashboard (README step 5) lets the
+         card cap the whole day.</p>`
+      : "";
     const hint = model.today && model.forecast && !model.forecast.curve?.full
       ? `<p>To see the rest of today's forecast on the chart, add the Forecast.Solar entries to your solar
          panels in the Energy dashboard settings.</p>`
@@ -791,7 +911,7 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       <p>Downloaded by Home Assistant over the internet, based on each Forecast.Solar entry's location, tilt,
       direction and size. Today's percentage compares the energy produced so far with what the forecast expected
       by now; for an earlier day it compares the whole day.</p>
-      ${mapping}${hint}
+      ${mapping}${limitText}${partial}${hint}
     </div>`;
   }
 
@@ -1016,13 +1136,18 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       ? `<path d="${fpoints.map((p, i) => `${i ? "L" : "M"}${x(p.t).toFixed(1)},${y(p.v).toFixed(1)}`).join("")}"
            fill="none" stroke="${forecastStroke}" stroke-width="2" stroke-dasharray="5 4" stroke-linejoin="round"/>`
       : "";
+    const limit = model.forecast?.limit;
+    const limitLine = limit && limit < yMax
+      ? `<line x1="${pad.l}" x2="${width - pad.r}" y1="${y(limit)}" y2="${y(limit)}" class="limit"/>
+         <text x="${width - pad.r}" y="${y(limit) - 4}" text-anchor="end" class="axis">Inverter limit</text>`
+      : "";
     this._chartGeom = { points: plotted, fpoints, fstep: fcurve?.step, x, y, pad, dayStart, dayEnd, innerW, step };
     const note = model.period === "hour" ? `<p class="muted note">Hourly averages: five-minute detail is no longer kept for this day.</p>` : "";
     return `${head}<div class="chart" data-chart="1">
       <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="Total optimizer output, peak ${formatPower(peak)}">
         ${grid}${ticks}
         <path d="${area}" fill="${stroke}" opacity="0.16"/>
-        ${fline}
+        ${limitLine}${fline}
         <path d="${line}" fill="none" stroke="${stroke}" stroke-width="2" stroke-linejoin="round"/>
         <line class="cross" x1="0" x2="0" y1="${pad.t}" y2="${pad.t + innerH}" visibility="hidden"/>
         <circle class="cross-dot" r="4" fill="${stroke}" visibility="hidden"/>
@@ -1231,6 +1356,7 @@ const STYLES = `
   .axis { font-size: 10px; fill: var(--secondary-text-color); font-variant-numeric: tabular-nums; }
   .gridline { stroke: var(--divider-color); stroke-width: 1; }
   .baseline { stroke: var(--secondary-text-color); stroke-width: 1; opacity: 0.6; }
+  .limit { stroke: var(--secondary-text-color); stroke-width: 1; stroke-dasharray: 1 3; }
   .cross { stroke: var(--secondary-text-color); stroke-width: 1; stroke-dasharray: 3 3; }
   .cross-dot { stroke: var(--card-background-color, #fff); stroke-width: 2; }
 
@@ -1414,6 +1540,23 @@ class SolarEdgeOptimizersCardEditor extends HTMLElement {
     }
   }
 
+  /** Placeholder text describing the inverter rating the card would use. */
+  _detectedLimit() {
+    const hass = this._hass;
+    const inverters = new Set();
+    for (const entry of Object.values(hass.entities || {})) {
+      if (entry.platform !== DOMAIN || entry.translation_key !== "health") continue;
+      const parent = hass.devices?.[entry.device_id]?.via_device_id;
+      if (parent) inverters.add(parent);
+    }
+    const models = [...inverters].map((id) => hass.devices?.[id]?.model);
+    if (models.length === 1) {
+      const rating = inverterRating(models[0]);
+      return rating ? `Detected ${rating} W from ${models[0]}` : "Couldn't read the rating; enter it";
+    }
+    return models.length ? "Read from each inverter's model" : "";
+  }
+
   _update(patch) {
     const config = { ...this._config, ...patch };
     for (const [key, value] of Object.entries(patch)) if (value === undefined) delete config[key];
@@ -1464,14 +1607,20 @@ class SolarEdgeOptimizersCardEditor extends HTMLElement {
       <label class="field"><span>Optimizers in "lowest" list</span><input type="number" min="0" max="20" data-key="show_weakest" value="${esc(c.show_weakest ?? 5)}"></label>
       <label class="check"><input type="checkbox" data-key="show_history" ${c.show_history !== false ? "checked" : ""}> Show the output curve</label>
       <h3>Predicted generation</h3>
-      ${forecastSection}`;
+      ${forecastSection}
+      ${forecasts.length ? `<label class="field"><span>Inverter AC limit (W)</span>
+        <input type="number" min="0" step="100" data-key="inverter_power" value="${esc(typeof c.inverter_power === "number" ? c.inverter_power : "")}"
+          placeholder="${esc(this._detectedLimit())}"></label>
+        <p class="hint">Strings on one inverter can't produce more than it can deliver, so their combined forecast is
+        capped at its AC rating. Leave this empty to use the rating read from the inverter's model.</p>` : ""}`;
     this.shadowRoot.querySelectorAll("[data-key]").forEach((el) => {
       el.addEventListener("change", () => {
         const key = el.dataset.key;
         let value = el.type === "checkbox" ? el.checked : el.value;
         if (key === "show_weakest") value = Number(value);
+        if (key === "inverter_power") value = Number(value) > 0 ? Number(value) : undefined;
         // Keep the YAML short: leave defaults out.
-        const defaults = { show_history: true, forecast: true, style: "default", show_weakest: 5 };
+        const defaults = { show_history: true, forecast: true, style: "default", show_weakest: 5, inverter_power: undefined };
         this._update({ [key]: defaults[key] === value ? undefined : value });
       });
     });

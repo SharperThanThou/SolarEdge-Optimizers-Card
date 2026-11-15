@@ -11,7 +11,8 @@
   ?day=-1 to open yesterday (or -20 for an hourly-only day),
   ?map to match strings to forecasts, ?solar for the Energy dashboard forecast curve,
   ?noforecast for no Forecast.Solar, ?note to open the forecast note, ?editor for the editor,
-  ?unnamed to leave one Forecast.Solar entry without a name.
+  ?unnamed to leave one Forecast.Solar entry without a name,
+  ?model=SE11400H to change the inverter model (its rating caps the forecast).
 -->
 <link rel="preconnect" href="https://fonts.gstatic.com">
 <style>
@@ -60,7 +61,7 @@
   const now = new Date();
   const iso = (d) => d.toISOString();
   devices.site = { name: "SolarEdge site 1234567" };
-  devices.inv = { name: "Inverter 7E1A2B3C", via_device_id: "site" };
+  devices.inv = { name: "Inverter 7E1A2B3C", via_device_id: "site", model: params.get("model") || "SE7600H-US000BNU4" };
   const add = (id, device, key, state, attributes = {}) => {
     entities[id] = { entity_id: id, platform: "solaredge_optimizers", device_id: device, translation_key: key };
     states[id] = { entity_id: id, state: String(state), attributes, last_updated: iso(now) };

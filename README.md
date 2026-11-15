@@ -85,6 +85,7 @@ It's a single-card *panel* view, so the map uses the full width.
 | `max_power` | (highest current output) | Fix the power that gets the darkest shade, e.g. your optimizers' rated power. By default the shading is relative to the best optimizer right now. |
 | `site` | (all sites) | Only show the site whose device name contains this text. |
 | `forecast` | `true` | Show predicted generation when Forecast.Solar is set up. `false` hides it. |
+| `inverter_power` | (from the model) | The inverter's AC limit in W, which caps the combined forecast of the strings on it. Normally read from the inverter's model. A number applies to every inverter; for several, use `{"Inverter name": watts}`. See [Strings sharing an inverter](#strings-sharing-an-inverter). |
 | `forecast_strings` | (none) | Which Forecast.Solar entry belongs to each string, by entry name or ID. See [step 4](#step-4-match-each-string-to-its-forecast). |
 
 All of these can also be set in the card's visual editor.
@@ -150,6 +151,11 @@ entry.
    - **Azimuth**: the direction.
    - **Total Watt peak power of your solar modules**: the size in watts.
 4. Submit, then repeat for the next roof face.
+
+Leave Forecast.Solar's own *Inverter size* option (under **Configure**)
+empty. It caps each entry on its own, which doesn't help when several entries
+share one inverter. The card handles that instead; see
+[Strings sharing an inverter](#strings-sharing-an-inverter).
 
 ### Step 2: Check the forecasts are working
 
@@ -219,6 +225,48 @@ integration doesn't provide one.
 
 This also adds a forecast to Home Assistant's own Energy dashboard.
 
+### Strings sharing an inverter
+
+Each Forecast.Solar entry only knows about its own panels. If three strings
+are rated 5,120 W, 5,120 W and 4,400 W, their forecasts can add up to more than
+14 kW, but if all three feed one inverter rated, say, 11,400 W, the site can
+never deliver more than 11,400 W. On a bright day the separate forecasts would
+over-promise.
+
+So the card adds up the forecasts of all strings on the same inverter at each
+point in the day, caps the total at the inverter's AC rating, and scales each
+string's forecast down in proportion. This happens automatically:
+
+- **Which strings share an inverter** comes from the SolarEdge layout: each
+  optimizer sits under its inverter.
+- **The inverter's rating** is read from its model, which the integration
+  gets from the portal. SolarEdge model names include it: *SE11400H* is
+  11,400 W, *SE10K* is 10,000 W. To check it, open the inverter's device under
+  **Settings → Devices & services → SolarEdge Optimizers**.
+- If the rating can't be read, or you want a different limit, set it in the
+  card's editor under **Inverter AC limit (W)**, or in YAML:
+
+  ```yaml
+  inverter_power: 11400
+  ```
+
+  With several inverters, give each one by its device name:
+  `inverter_power: {"Inverter 1": 11400, "Inverter 2": 7600}`.
+
+Click **Forecast** to see which limit is being used. The chart shows a dotted
+*Inverter limit* line when the forecast or the actual output gets close to
+it.
+
+The cap needs the forecast through the day, not just its total. For earlier
+days Home Assistant has recorded that, so the cap is exact. For today it's
+exact if you've done step 5. Without step 5 the card can only cap the part of
+today that's already been recorded, so on a day the inverter limits output,
+today's forecast total can read a little high until the day is over.
+
+If you leave every string unmatched, the card treats all Forecast.Solar
+entries as one site forecast and caps it at the inverter's rating, or at the
+inverters' ratings added up if there are several.
+
 ### What you'll see
 
 - **Forecast**, next to the day's energy: the forecast total for the day.
@@ -253,6 +301,8 @@ within it.
 | Forecast is *–* | The entry's sensors aren't reporting yet, or Home Assistant can't reach forecast.solar. Check the entry on the Forecast.Solar page. |
 | The dashed line stops at the current time | Expected without step 5. |
 | Percentages look far off for one string | Check that string's entry: tilt, direction and especially size. A wrong size shifts the percentage in proportion. |
+| Forecast flattens at the inverter limit | Expected on bright days: see [Strings sharing an inverter](#strings-sharing-an-inverter). |
+| *rating couldn't be read* in the Forecast note | Set **Inverter AC limit (W)** in the card's editor. |
 | "Add plane" asks for an API key | Each entry is one roof face on the free plan. Add another entry instead (step 1). |
 
 
