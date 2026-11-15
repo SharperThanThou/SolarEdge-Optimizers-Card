@@ -19,6 +19,9 @@ integration. It shows every optimizer on your site at once:
   earlier day it shows the day's total, shaded by energy. Optimizers with a
   health problem get a coloured ring, an icon and the problem written on the
   tile.
+- **Predicted generation (optional).** A forecast for the site and for each
+  string from Home Assistant's Forecast.Solar integration, with how much of
+  it you've produced, and a dashed forecast line on the output curve.
 - **Output curve.** The site's total optimizer output through the day.
 - **Lowest output vs peers.** The optimizers producing least compared with
   the median of their string, with 100% marked. For an earlier day this
@@ -33,7 +36,7 @@ There's also an LCARS-inspired style (`style: lcars`), with an elbow frame,
 sidebar readouts, pill-shaped optimizer buttons and a red-alert pulse on
 faults:
 
-![The LCARS style showing yesterday, with made-up data](docs/screenshot-lcars.png)
+![The LCARS style with forecasts, with made-up data](docs/screenshot-lcars.png)
 
 The card needs no setup. It finds the optimizers through the integration, so
 renamed entities, and optimizers added later, are picked up automatically.
@@ -81,6 +84,61 @@ It's a single-card *panel* view, so the map uses the full width.
 | `show_weakest` | `5` | How many optimizers to list under *Lowest output vs peers*. `0` hides the list. |
 | `max_power` | (highest current output) | Fix the power that gets the darkest shade, e.g. your optimizers' rated power. By default the shading is relative to the best optimizer right now. |
 | `site` | (all sites) | Only show the site whose device name contains this text. |
+| `forecast` | `true` | Show predicted generation when Forecast.Solar is set up. `false` hides it. |
+| `forecast_strings` | (none) | Which Forecast.Solar entry belongs to each string, by entry title or ID. See below. |
+
+All of these can also be set in the card's visual editor.
+
+## Predicted generation
+
+The card can show how much your panels were expected to produce, using Home
+Assistant's built-in
+[Forecast.Solar](https://www.home-assistant.io/integrations/forecast_solar/)
+integration. **It needs an internet connection**: Home Assistant downloads the
+forecast from forecast.solar, using your home's location from **Settings →
+System → General** and the tilt, compass direction and size you give each
+Forecast.Solar entry. The card itself doesn't contact anything. Until a
+forecast is set up, the *Forecast* figure says *Set up*; click it for
+instructions.
+
+1. Add Forecast.Solar once for each roof face your strings are on
+   ([add it here](https://my.home-assistant.io/redirect/config_flow_start/?domain=forecast_solar)).
+   Give each entry a clear name such as *South roof*, and set:
+   - **Declination**: the panels' tilt, 0° flat to 90° vertical.
+   - **Azimuth**: the direction they face, 0° north, 90° east, 180° south, 270° west.
+   - **Modules power**: the panels' total rating in watts (number of panels × each panel's rated W).
+2. Open this card's settings and choose the matching entry for each string.
+
+```yaml
+type: custom:solaredge-optimizers-card
+forecast_strings:
+  "1.0": South roof   # quote string names, or YAML reads 1.0 as a number
+  "1.1": West roof
+  "1.2": East roof
+```
+
+Then the card shows:
+
+- **Forecast** next to the day's energy: the day's predicted total. Today it
+  also shows the energy so far as a percentage of what the forecast expected
+  by now; for an earlier day, the actual total as a percentage of the forecast.
+- **Each string's forecast** and the same percentage, in its header. A string
+  that falls well short of its own forecast on a clear day is worth a look.
+- **A dashed forecast line** on the output curve.
+
+If you don't match any strings, the site forecast adds up every Forecast.Solar
+entry, which suits a single entry for the whole system.
+
+The forecast line for the rest of today is only available if the
+Forecast.Solar entries are also added to your solar panels in the Energy
+dashboard settings (Home Assistant only offers the full forecast that way).
+Without that, the card draws the forecast for the part of the day already
+recorded. Earlier days' forecasts come from what Home Assistant recorded at
+the time, so they start from when you set Forecast.Solar up.
+
+On the free Forecast.Solar plan, Home Assistant refreshes each entry once an
+hour. Forecast.Solar limits free requests per hour, which a few entries stay
+well within.
 
 ## How it reads the data
 
