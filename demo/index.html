@@ -11,7 +11,10 @@
   ?day=-1 to open yesterday (or -20 for an hourly-only day),
   ?map to match strings to forecasts, ?solar for the Energy dashboard forecast curve,
   ?noforecast for no Forecast.Solar, ?note to open the forecast note, ?editor for the editor,
-  ?unnamed to leave one Forecast.Solar entry without a name.
+  ?unnamed to leave one Forecast.Solar entry without a name,
+  ?model=SE11400H to change the inverter model, ?nolimit to leave out its Maximum AC power sensor,
+  ?auto to name forecast entries after strings, ?badsize for a wrongly sized entry,
+  ?shared for two strings sharing one entry.
 -->
 <link rel="preconnect" href="https://fonts.gstatic.com">
 <style>
@@ -60,16 +63,21 @@
   const now = new Date();
   const iso = (d) => d.toISOString();
   devices.site = { name: "SolarEdge site 1234567" };
-  devices.inv = { name: "Inverter 7E1A2B3C", via_device_id: "site" };
+  devices.inv = { name: "Inverter 7E1A2B3C", via_device_id: "site", model: params.get("model") || "SE10000H-US000BNU4" };
   const add = (id, device, key, state, attributes = {}) => {
     entities[id] = { entity_id: id, platform: "solaredge_optimizers", device_id: device, translation_key: key };
     states[id] = { entity_id: id, state: String(state), attributes, last_updated: iso(now) };
   };
   add("binary_sensor.site_problem", "site", "any_optimizer_problem", "on");
   add("sensor.site_unhealthy", "site", "unhealthy_optimizers", 3);
+  // The inverter's Maximum AC power from the portal (?nolimit leaves it out).
+  if (!params.has("nolimit")) add("sensor.inverter_maximum_ac_power", "inv", "max_ac_power", "10000.0", { device_class: "power", unit_of_measurement: "W" });
 
-  const problems = { "1.0.7": ["low_output", 0.42], "1.1.15": ["no_output", 0.0], "1.1.3": ["not_reporting", null] };
-  const strings = [["1.0", 15], ["1.1", 15], ["1.2", 14]];
+  // Like the portal: string names include "String", two strings of 16 × 320 W
+  // panels and one of 10 × 440 W.
+  const problems = { "1.1.7": ["low_output", 0.42], "1.2.15": ["no_output", 0.0], "1.2.3": ["not_reporting", null] };
+  const strings = [["1.1", 16], ["1.2", 16], ["1.3", 10]];
+  const PANELS = { "1.1": ["Silfab Solar Inc. SLA-M 320", 320], "1.2": ["Silfab Solar Inc. SLA-M 320", 320], "1.3": ["REC Alpha Pure 440", 440] };
   const factors = {};
   let seed = 4;
   const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
@@ -78,7 +86,7 @@
       const name = `${string}.${n}`;
       const dev = `opt_${name}`;
       devices[dev] = { name: `Optimizer ${name}`, via_device_id: "inv" };
-      const base = { "1.0": 300, "1.1": 255, "1.2": 280 }[string];
+      const base = { "1.1": 290, "1.2": 255, "1.3": 395 }[string];
       let factor = 0.9 + rand() * 0.2;
       let status = night ? "unknown" : "ok";
       let reported = new Date(now - 6 * 60000);
@@ -90,7 +98,8 @@
       const watts = night ? 0 : base * factor;
       const slug = `optimizer_${name.replaceAll(".", "_")}`;
       factors[`sensor.${slug}_power`] = { base, factor: problems[name] ? (problems[name][1] ?? 0) : factor, name };
-      add(`sensor.${slug}_health`, dev, "health", status, { string, candidate: status });
+      add(`sensor.${slug}_health`, dev, "health", status, {
+        string: `String ${string}`, candidate: status, panel_model: PANELS[string][0], panel_power: PANELS[string][1], panels: 1 });
       add(`sensor.${slug}_power`, dev, undefined, watts.toFixed(1), { device_class: "power", unit_of_measurement: "W" });
       add(`sensor.${slug}_output_vs_peers`, dev, "peer_ratio", night || status === "not_reporting" ? "unknown" : (factor * 100).toFixed(1));
       add(`sensor.${slug}_module_voltage`, dev, "module_voltage", night ? "0" : (36 + rand() * 4).toFixed(1));
@@ -99,11 +108,18 @@
   }
 
   // Fake Forecast.Solar: one entry per roof face, peaking at different times.
+  // ?auto names the entries after their strings so the card matches them
+  // itself; ?badsize sets the West entry's plane to the wrong size.
   const FACES = params.has("noforecast") ? [] : [
-    { id: "fs_south", title: "South roof", string: "1.0", kwp: 4.6, shift: 0 },
-    { id: "fs_west", title: "West roof", string: "1.1", kwp: 4.0, shift: 1.6 },
-    { id: "fs_east", title: "East roof", string: "1.2", kwp: 4.2, shift: -1.6 },
+    { id: "fs_south", title: params.has("auto") ? "String 1.1" : "South roof", string: "1.1", kwp: 5.12, shift: 0 },
+    { id: "fs_west", title: params.has("auto") ? "1.2" : "West roof", string: "1.2", kwp: params.has("badsize") ? 4.6 : 5.12, shift: 1.6 },
+    { id: "fs_east", title: params.has("auto") ? "1.3" : "East roof", string: "1.3", kwp: 4.4, shift: -1.6 },
   ];
+  // ?shared: strings 1.1 and 1.2 on one roof face, in one entry named "1.1 + 1.2".
+  if (params.has("shared")) {
+    FACES.splice(0, 2, { id: "fs_south", title: "1.1 + 1.2", string: "1.1", kwp: 10.24, shift: 0 });
+    FACES[1].title = "1.3";
+  }
   const faceWatts = (face, t, daysAgo) => {
     const d = new Date(t);
     const h = d.getHours() + d.getMinutes() / 60 - face.shift;
@@ -140,7 +156,12 @@
   async function callWS(msg) {
     // ?unnamed leaves the East entry with Forecast.Solar's default blank title.
     if (msg.type === "config_entries/get") return FACES.map((f) => ({ entry_id: f.id, title: params.has("unnamed") && f.id === "fs_east" ? "" : f.title, domain: "forecast_solar" }));
-    if (msg.type === "config_entries/subentries/list") return [{ subentry_id: "p1", subentry_type: "plane", title: "30° / 90° / 4200W" }];
+    if (msg.type === "config_entries/subentries/list") {
+      const face = FACES.find((f) => f.id === msg.entry_id);
+      const azimuth = { fs_south: 180, fs_west: 270, fs_east: 90 }[face.id];
+      if (!face) return [];
+      return [{ subentry_id: `p_${face.id}`, subentry_type: "plane", title: `30° / ${azimuth}° / ${Math.round(face.kwp * 1000)}W` }];
+    }
     if (msg.type === "energy/solar_forecast") {
       if (!params.has("solar")) return {};
       const out = {};
@@ -194,6 +215,7 @@
 
   const card = document.createElement("solaredge-optimizers-card");
   const config = params.has("lcars") ? { style: "lcars" } : {};
+  // Map like a user typing YAML: bare string names, entry names as values.
   if (params.has("map")) config.forecast_strings = Object.fromEntries(FACES.map((f) => [f.string, f.title]));
   card.setConfig(config);
   document.getElementById("host").append(card);
