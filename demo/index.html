@@ -10,7 +10,8 @@
   ?w=358 for a phone-width card, ?lcars for the LCARS style,
   ?day=-1 to open yesterday (or -20 for an hourly-only day),
   ?map to match strings to forecasts, ?solar for the Energy dashboard forecast curve,
-  ?noforecast for no Forecast.Solar, ?note to open the forecast note, ?editor for the editor.
+  ?noforecast for no Forecast.Solar, ?note to open the forecast note, ?editor for the editor,
+  ?unnamed to leave one Forecast.Solar entry without a name.
 -->
 <link rel="preconnect" href="https://fonts.gstatic.com">
 <style>
@@ -137,7 +138,9 @@
   const DAY = 86400000;
   const midnight = (t) => { const d = new Date(t); d.setHours(0, 0, 0, 0); return d.getTime(); };
   async function callWS(msg) {
-    if (msg.type === "config_entries/get") return FACES.map((f) => ({ entry_id: f.id, title: f.title, domain: "forecast_solar" }));
+    // ?unnamed leaves the East entry with Forecast.Solar's default blank title.
+    if (msg.type === "config_entries/get") return FACES.map((f) => ({ entry_id: f.id, title: params.has("unnamed") && f.id === "fs_east" ? "" : f.title, domain: "forecast_solar" }));
+    if (msg.type === "config_entries/subentries/list") return [{ subentry_id: "p1", subentry_type: "plane", title: "30° / 90° / 4200W" }];
     if (msg.type === "energy/solar_forecast") {
       if (!params.has("solar")) return {};
       const out = {};

@@ -766,15 +766,16 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       return `<div class="note-panel" role="note">${close}
         <strong>Predicted generation needs an internet connection.</strong>
         <p>It comes from Home Assistant's Forecast.Solar integration, which downloads a forecast from
-        forecast.solar using your home's location (Settings → System → General) and the tilt, direction
-        and size of your panels. This card doesn't contact anything itself.</p>
-        <p>Add one Forecast.Solar entry per roof face, then choose which entry belongs to each string in
-        this card's settings.</p>
+        forecast.solar using your location and the tilt, direction and size of your panels. This card doesn't
+        contact anything itself.</p>
+        <p>Add Forecast.Solar once for each roof face, rename each entry after its roof face (for example
+        "South roof"), then choose which entry belongs to each string in this card's settings. The card's
+        README has step-by-step instructions.</p>
         <p><a href="${SETUP_FORECAST_URL}" target="_blank" rel="noreferrer">Set up Forecast.Solar</a></p>
       </div>`;
     }
     const titles = this._forecastTitles || new Map();
-    const name = (id) => esc(titles.get(id) || "Forecast.Solar entry");
+    const name = (id) => esc(titles.get(id) || "an unnamed Forecast.Solar entry");
     const mapped = model.strings.filter((g) => model.plan.byString.has(g.name));
     const mapping = mapped.length
       ? `<ul>${mapped.map((g) => `<li>${esc(this._stringTitle(g.name, model.strings.length))} → ${name(model.plan.byString.get(g.name))}</li>`).join("")}</ul>`
@@ -787,7 +788,7 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       : "";
     return `<div class="note-panel" role="note">${close}
       <strong>Predicted generation from Forecast.Solar</strong>
-      <p>Downloaded by Home Assistant over the internet, based on your home's location and each entry's tilt,
+      <p>Downloaded by Home Assistant over the internet, based on each Forecast.Solar entry's location, tilt,
       direction and size. Today's percentage compares the energy produced so far with what the forecast expected
       by now; for an earlier day it compares the whole day.</p>
       ${mapping}${hint}
@@ -1396,8 +1397,17 @@ class SolarEdgeOptimizersCardEditor extends HTMLElement {
     if (first) {
       this._strings = discoverStrings(hass);
       this._forecasts = discoverForecasts(hass);
-      loadForecastTitles(hass).then((titles) => {
+      loadForecastTitles(hass).then(async (titles) => {
         this._titles = titles;
+        // New Forecast.Solar entries have no name. Describe those by their
+        // planes ("30° / 180° / 4600W") so they can still be told apart.
+        this._planes = new Map();
+        for (const id of this._forecasts.keys()) {
+          if (titles.get(id)) continue;
+          const subentries = await hass.callWS({ type: "config_entries/subentries/list", entry_id: id }).catch(() => []);
+          const planes = subentries.filter((sub) => sub.subentry_type === "plane").map((sub) => sub.title);
+          if (planes.length) this._planes.set(id, planes.join(" + "));
+        }
         this._render();
       });
       this._render();
@@ -1416,18 +1426,23 @@ class SolarEdgeOptimizersCardEditor extends HTMLElement {
     const c = this._config;
     const forecasts = [...(this._forecasts || new Map()).keys()];
     const titles = this._titles || new Map();
+    const label = (id) => titles.get(id) || (this._planes?.get(id) ? `Unnamed: ${this._planes.get(id)}` : "Unnamed Forecast.Solar entry");
+    const unnamed = forecasts.some((id) => !titles.get(id));
     const mapping = c.forecast_strings || {};
     const option = (value, label, selected) => `<option value="${esc(value)}" ${selected ? "selected" : ""}>${esc(label)}</option>`;
     const stringRows = (this._strings || []).map((name) => {
       const current = mapping[name] || "";
       const options = [option("", "No forecast", !current), ...forecasts.map((id) =>
-        option(id, titles.get(id) || id, current === id || (titles.get(id) || "").toLowerCase() === String(current).toLowerCase()))];
+        option(id, label(id), current === id || Boolean(current && titles.get(id) && titles.get(id).toLowerCase() === String(current).toLowerCase())))];
       return `<label class="row"><span>String ${esc(name)}</span><select data-string="${esc(name)}">${options.join("")}</select></label>`;
     });
     const forecastSection = forecasts.length
       ? `<label class="check"><input type="checkbox" data-key="forecast" ${c.forecast !== false ? "checked" : ""}> Show predicted generation</label>
          <p class="hint">Match each string to the Forecast.Solar entry for the roof face it's on. Leave them all on
          "No forecast" to add up every entry as a site total.</p>
+         ${unnamed ? `<p class="hint">Some Forecast.Solar entries have no name, so they're shown as tilt / direction /
+         size. To name one, open Settings → Devices &amp; services → Forecast.Solar, choose ⋮ next to the entry,
+         then Rename.</p>` : ""}
          ${stringRows.join("")}`
       : `<p class="hint">Predicted generation uses Home Assistant's Forecast.Solar integration, which needs an internet
          connection. Add one entry per roof face, then come back here to match them to strings.
