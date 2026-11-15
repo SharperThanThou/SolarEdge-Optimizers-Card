@@ -87,6 +87,7 @@ It's a single-card *panel* view, so the map uses the full width.
 | `forecast` | `true` | Show predicted generation when Forecast.Solar is set up. `false` hides it. |
 | `inverter_power` | (from the model) | The inverter's AC limit in W, which caps the combined forecast of the strings on it. Normally read from the inverter's model. A number applies to every inverter; for several, use `{"Inverter name": watts}`. See [Strings sharing an inverter](#strings-sharing-an-inverter). |
 | `forecast_strings` | (none) | Which Forecast.Solar entry belongs to each string, by entry name or ID. See [step 4](#step-4-match-each-string-to-its-forecast). |
+| `forecast_match_names` | `true` | Match Forecast.Solar entries named after strings (such as *1.1* or *1.1 + 1.2*) automatically. `false` turns that off. |
 
 All of these can also be set in the card's visual editor.
 
@@ -108,16 +109,40 @@ card's *Forecast* figure says *Set up*; click it for a short explanation.
 There are two kinds of names involved, and they come from different places:
 
 - **String names** come from your SolarEdge site layout. The card shows them
-  as the headings over each group of optimizers: *String 1.0*, *String 1.1*
-  and so on. The name is the part after "String" (`1.0`). You can't change
-  these; they're whatever the SolarEdge portal calls your strings.
-- **Forecast names** are names you give your Forecast.Solar entries, such as
-  *South roof*. Forecast.Solar creates entries without a name, so you rename
-  them yourself (step 3).
+  as the headings over each group of optimizers, such as *String 1.1*. You
+  can't change these; they're whatever the SolarEdge portal calls your
+  strings. *String 1.1* and *1.1* mean the same string everywhere in the card.
+- **Forecast names** are names you give your Forecast.Solar entries.
+  Forecast.Solar creates entries without a name, so you rename them yourself
+  (step 3).
 
-Matching a string to a forecast tells the card "the panels in string 1.0 are
+Matching a string to a forecast tells the card "the panels in string 1.1 are
 on the south roof, so compare them with the south roof forecast". Strings on
 the same roof face can share one forecast.
+
+**The simplest way is to name each entry after its string**, such as *1.1*,
+or *1.1 + 1.2* for two strings on the same roof face. The card then matches
+them by itself and step 4 is done.
+
+### What the card works out for you
+
+The SolarEdge Optimizers integration (version 0.2 or later) reads your layout
+from the portal, so the card already knows:
+
+- **Each string's panels and their total rating.** The editor shows it under
+  each string, such as *16 panels × 320 W = 5,120 W*: that's the figure to
+  enter as *Total Watt peak power* in step 1.
+- **Whether each entry's size is right.** If an entry's size doesn't match
+  the panels of the strings using it, the editor says so and what to change.
+- **How to split a shared entry.** When strings on one roof face share an
+  entry, its forecast is divided between them by their panels' rating.
+- **Each optimizer's share.** Hover over a panel to compare it with its share
+  of the forecast.
+- **The inverter's AC limit**, for capping the forecast (see
+  [Strings sharing an inverter](#strings-sharing-an-inverter)).
+
+What it can't know is each roof face's tilt and direction, which is why the
+Forecast.Solar entries are still needed.
 
 ### Before you start
 
@@ -125,10 +150,10 @@ For each roof face that has panels, note:
 
 | | What it means | Example |
 | --- | --- | --- |
-| Strings | Which strings have panels on this face. In the card, hover over a panel tile to see its string. | 1.0 |
+| Strings | Which strings have panels on this face. In the card, hover over a panel tile to see its string. | 1.1 |
 | Tilt | Angle of the panels from horizontal: 0° is flat, 90° is vertical. Most pitched roofs are 20–45°. | 30° |
 | Direction | The compass direction the panels face: 0° north, 90° east, 180° south, 270° west. A compass app held flat against a panel, or your installer's design documents, will tell you. | 180° |
-| Size | Total rated power of the panels on this face in watts: number of panels × each panel's rating. The rating is on the panel's label or your installation paperwork. | 15 × 310 W = 4650 W |
+| Size | Total rated power of the panels on this face in watts. The card's editor shows each string's total; otherwise it's the number of panels × each panel's rating, from the panel's label or your installation paperwork. | 16 × 320 W = 5,120 W |
 
 If one string covers two roof faces, use the face where most of its panels
 are.
@@ -164,19 +189,24 @@ Open **Settings → Devices & services → Forecast.Solar**. Each entry has a
 production - today*. During the day these should show sensible numbers within
 a few minutes.
 
-### Step 3: Name each entry after its roof face
+### Step 3: Name each entry
 
 Forecast.Solar lists new entries without a name, which makes them hard to
 tell apart. On the Forecast.Solar page, each entry has its roof face listed
 underneath as tilt / direction / size, such as *30° / 180° / 4650W*, so you
-can tell which is which. Choose **⋮** next to an entry, then **Rename**, and
-name it after its roof face, such as *South roof*.
+can tell which is which. Choose **⋮** next to an entry, then **Rename**.
+Name it after the string or strings on that roof face, such as *1.1* or
+*1.1 + 1.2*, and the card matches it automatically. Any other name, such as
+*South roof*, works too, but then you match it yourself in step 4.
 
 If you skip this, the card's editor still lists unnamed entries by their tilt
 / direction / size, but names are clearer, and the Energy dashboard (step 5)
 only shows names.
 
 ### Step 4: Match each string to its forecast
+
+Skip this if you named the entries after their strings in step 3: the editor
+shows those strings as *matched by the entry's name*.
 
 **With the editor:** open the dashboard, choose **Edit dashboard**, then edit
 this card. Under **Predicted generation** there's a list for every string;
@@ -187,13 +217,14 @@ choose the entry for the roof face that string is on, and save.
 ```yaml
 type: custom:solaredge-optimizers-card
 forecast_strings:
-  "1.0": South roof
-  "1.1": West roof
-  "1.2": East roof
+  "1.1": South roof
+  "1.2": West roof
+  "1.3": East roof
 ```
 
-- The string name must match the card's heading exactly (`1.0` for *String
-  1.0*). Keep the quotes: without them YAML reads `1.0` as the number 1.
+- The string name is the card's heading, with or without "String": `"1.1"`
+  and `"String 1.1"` both work. Keep the quotes: without them YAML reads
+  `1.10` as the number 1.1.
 - The forecast name must match the entry's name, ignoring capitals. The editor
   saves the entry's ID instead of its name, so renaming the entry later
   doesn't break it.
@@ -239,9 +270,10 @@ string's forecast down in proportion. This happens automatically:
 
 - **Which strings share an inverter** comes from the SolarEdge layout: each
   optimizer sits under its inverter.
-- **The inverter's rating** is read from its model, which the integration
-  gets from the portal. SolarEdge model names include it: *SE11400H* is
-  11,400 W, *SE10K* is 10,000 W. To check it, open the inverter's device under
+- **The inverter's limit** comes from its *Maximum AC power* sensor, which
+  the integration (0.2 or later) reads from the portal. With older versions
+  it's read from the model name instead: *SE11400H* is 11,400 W, *SE10K* is
+  10,000 W. To check it, open the inverter's device under
   **Settings → Devices & services → SolarEdge Optimizers**.
 - If the rating can't be read, or you want a different limit, set it in the
   card's editor under **Inverter AC limit (W)**, or in YAML:
@@ -300,7 +332,8 @@ within it.
 | A string has no *forecast* in its heading | It isn't matched. Check step 4: the string name is quoted and matches the heading. |
 | Forecast is *–* | The entry's sensors aren't reporting yet, or Home Assistant can't reach forecast.solar. Check the entry on the Forecast.Solar page. |
 | The dashed line stops at the current time | Expected without step 5. |
-| Percentages look far off for one string | Check that string's entry: tilt, direction and especially size. A wrong size shifts the percentage in proportion. |
+| Percentages look far off for one string | Check that string's entry: tilt, direction and especially size. A wrong size shifts the percentage in proportion. The editor warns when an entry's size doesn't match its strings' panels. |
+| The editor shows no panel ratings | Update the SolarEdge Optimizers integration to 0.2 or later and restart Home Assistant. |
 | Forecast flattens at the inverter limit | Expected on bright days: see [Strings sharing an inverter](#strings-sharing-an-inverter). |
 | *rating couldn't be read* in the Forecast note | Set **Inverter AC limit (W)** in the card's editor. |
 | "Add plane" asks for an API key | Each entry is one roof face on the free plan. Add another entry instead (step 1). |

@@ -187,6 +187,71 @@ async function loadForecastTitles(hass) {
   }
 }
 
+/** "String 1.1", "string 1.1" and "1.1" all name the same string. */
+const stringKey = (name) => String(name ?? "").replace(/^string\s*/i, "").trim().toLowerCase();
+const stringLabel = (name) => (/^string/i.test(String(name)) ? String(name) : `String ${name}`);
+
+/** The strings a Forecast.Solar entry's name refers to: "1.1", "String 1.1", "1.1 + 1.2". */
+function titleStrings(title, known) {
+  if (!title) return [];
+  const whole = stringKey(title);
+  if (known.has(whole)) return [whole];
+  return title.split(/\s*(?:,|\+|&|\band\b)\s*/i).map(stringKey).filter((key) => known.has(key));
+}
+
+/**
+ * Which Forecast.Solar entry each string uses, as Map(stringKey -> entry ID).
+ * The card's settings win; otherwise an entry named after strings is used
+ * for them. `auto` lists the strings matched by name.
+ */
+function forecastMapping(config, entries, titles, knownStrings) {
+  const resolve = (value) => {
+    if (!value) return null;
+    if (entries.has(value)) return value;
+    const want = String(value).trim().toLowerCase();
+    for (const [id, title] of titles) if (entries.has(id) && title && title.trim().toLowerCase() === want) return id;
+    return null;
+  };
+  const byString = new Map();
+  const auto = new Set();
+  for (const [name, value] of Object.entries(config.forecast_strings || {})) {
+    const id = resolve(value);
+    if (id) byString.set(stringKey(name), id);
+  }
+  if (config.forecast_match_names !== false) {
+    for (const [id, title] of titles) {
+      if (!entries.has(id)) continue;
+      for (const key of titleStrings(title, knownStrings)) {
+        if (byString.has(key)) continue;
+        byString.set(key, id);
+        auto.add(key);
+      }
+    }
+  }
+  return { byString, auto };
+}
+
+/** Each string's panels, from the optimizers' health sensors: Map(stringKey -> {...}). */
+function stringRatings(hass) {
+  const ratings = new Map();
+  for (const entry of Object.values(hass.entities || {})) {
+    if (entry.platform !== DOMAIN || entry.translation_key !== "health") continue;
+    const attrs = hass.states[entry.entity_id]?.attributes || {};
+    const key = stringKey(attrs.string || "Unassigned");
+    if (!ratings.has(key)) ratings.set(key, { name: attrs.string || "Unassigned", panels: 0, watts: 0, known: true, sizes: new Set() });
+    const r = ratings.get(key);
+    const panels = Number(attrs.panels) || 1;
+    r.panels += panels;
+    if (Number(attrs.panel_power) > 0) {
+      r.watts += Number(attrs.panel_power) * panels;
+      r.sizes.add(Number(attrs.panel_power));
+    } else {
+      r.known = false;
+    }
+  }
+  return ratings;
+}
+
 /** String names reported by the optimizers' health sensors. */
 function discoverStrings(hass) {
   const names = new Set();
@@ -327,6 +392,13 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       this._optimizers = optimizers;
     }
     this._forecasts = discoverForecasts(hass);
+    // The integration's Maximum AC power sensor, by inverter device.
+    this._inverterLimits = new Map();
+    for (const entry of Object.values(hass.entities || {})) {
+      if (entry.platform === DOMAIN && entry.translation_key === "max_ac_power" && entry.device_id) {
+        this._inverterLimits.set(entry.device_id, entry.entity_id);
+      }
+    }
     this._entityIds = this._optimizers.flatMap((o) => [o.health, o.power, o.ratio, o.last]).filter(Boolean);
     this._entityIds.push(...this._sites.flatMap((s) => [s.problem, s.latest]).filter(Boolean));
     this._entityIds.push(...[...this._forecasts.values()].flatMap((f) => [f.today, f.remaining]).filter(Boolean));
@@ -345,23 +417,12 @@ class SolarEdgeOptimizersCard extends HTMLElement {
   _forecastPlan() {
     const entries = this._forecasts || new Map();
     const available = entries.size > 0;
-    if (this._config.forecast === false || !available) return { enabled: false, available, site: [], byString: new Map() };
-    const titles = this._forecastTitles || new Map();
-    const resolve = (value) => {
-      if (!value) return null;
-      if (entries.has(value)) return value;
-      const want = String(value).trim().toLowerCase();
-      for (const [id, title] of titles) if (entries.has(id) && title.trim().toLowerCase() === want) return id;
-      return null;
-    };
-    const byString = new Map();
-    for (const [name, value] of Object.entries(this._config.forecast_strings || {})) {
-      const id = resolve(value);
-      if (id) byString.set(String(name), id);
-    }
+    if (this._config.forecast === false || !available) return { enabled: false, available, site: [], byString: new Map(), auto: new Set() };
+    const known = new Set(this._optimizers.map((o) => stringKey(this._hass.states[o.health]?.attributes.string || "Unassigned")));
+    const { byString, auto } = forecastMapping(this._config, entries, this._forecastTitles || new Map(), known);
     // Without a mapping, assume every Forecast.Solar entry describes this site.
     const site = byString.size ? [...new Set(byString.values())] : [...entries.keys()];
-    return { enabled: true, available, site, byString };
+    return { enabled: true, available, site, byString, auto };
   }
 
   _deviceName(deviceId) {
@@ -526,6 +587,8 @@ class SolarEdgeOptimizersCard extends HTMLElement {
         status,
         statusLabel: health && this._hass.formatEntityState ? this._hass.formatEntityState(health) : STATUS[status].label,
         string: health?.attributes.string || "Unassigned",
+        dc: Number(health?.attributes.panel_power) > 0 ? Number(health.attributes.panel_power) * (Number(health.attributes.panels) || 1) : null,
+        panels: Number(health?.attributes.panels) || 1,
         watts,
         energy,
         peak: stat?.peak ?? null,
@@ -552,6 +615,8 @@ class SolarEdgeOptimizersCard extends HTMLElement {
           name,
           list,
           inverterId: list[0]?.inverterId || null,
+          dc: list.every((i) => i.dc) ? list.reduce((sum, i) => sum + i.dc, 0) : null,
+          panels: list.reduce((sum, i) => sum + i.panels, 0),
           watts: list.reduce((sum, i) => sum + (i.watts || 0), 0),
           energy: ready ? list.reduce((sum, i) => sum + (i.energy || 0), 0) : null,
           peak: totals.size ? Math.max(...totals.values()) : null,
@@ -686,10 +751,37 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       return { ...fig, ratio: actual !== null && base !== null && base > 50 ? (actual / base) * 100 : null };
     };
     const site = withRatio(combine(plan.site), energy);
+    const scale = (fig, k) => ({
+      total: fig.total === null ? null : fig.total * k,
+      expected: fig.expected === null ? null : fig.expected * k,
+    });
+    // Strings that share an entry (one roof face) split its forecast by their
+    // panels' rating, or by panel count when ratings aren't known.
+    const sharers = new Map();
     for (const group of strings) {
-      const id = plan.byString.get(group.name);
-      group.forecast = id ? withRatio(combine([id]), group.energy) : null;
+      const id = plan.byString.get(stringKey(group.name));
+      if (!id) continue;
+      if (!sharers.has(id)) sharers.set(id, []);
+      sharers.get(id).push(group);
+    }
+    for (const group of strings) {
+      const id = plan.byString.get(stringKey(group.name));
+      group.forecast = null;
       group.forecastTitle = id ? this._forecastTitles?.get(id) : null;
+      for (const item of group.list) item.forecast = null;
+      if (!id) continue;
+      const peers = sharers.get(id);
+      const byRating = peers.every((g) => g.dc);
+      const share = peers.length === 1 ? 1
+        : byRating ? group.dc / peers.reduce((sum, g) => sum + g.dc, 0)
+        : group.panels / peers.reduce((sum, g) => sum + g.panels, 0);
+      group.forecastShare = share;
+      group.forecast = withRatio(scale(combine([id]), share), group.energy);
+      // Each optimizer's part of its string's forecast.
+      for (const item of group.list) {
+        const part = group.dc && item.dc ? item.dc / group.dc : item.panels / group.panels;
+        item.forecast = withRatio(scale(group.forecast, part), item.energy);
+      }
     }
 
     const totals = new Map();
@@ -721,6 +813,8 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       } else if (Number(override) > 0) {
         return { name, limit: Number(override), source: "setting" };
       }
+      const sensor = num(this._hass.states[this._inverterLimits?.get(inverterId)]);
+      if (sensor && sensor > 0) return { name, limit: sensor, source: "portal" };
       const rating = inverterRating(device?.model);
       return { name, limit: rating, source: rating ? device.model : null };
     };
@@ -732,7 +826,7 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     if (plan.byString.size) {
       const placed = new Set();
       for (const group of strings) {
-        const id = plan.byString.get(group.name);
+        const id = plan.byString.get(stringKey(group.name));
         if (!id || placed.has(id)) continue;
         placed.add(id);
         add(group.inverterId || "unknown", id);
@@ -877,9 +971,16 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     }
     const titles = this._forecastTitles || new Map();
     const name = (id) => esc(titles.get(id) || "an unnamed Forecast.Solar entry");
-    const mapped = model.strings.filter((g) => model.plan.byString.has(g.name));
+    const mapped = model.strings.filter((g) => model.plan.byString.has(stringKey(g.name)));
+    const describe = (g) => {
+      const bits = [];
+      if (g.dc) bits.push(`${g.panels} panels, ${Math.round(g.dc).toLocaleString()} W`);
+      if (g.forecastShare !== undefined && g.forecastShare < 1) bits.push(`${Math.round(g.forecastShare * 100)}% of it, by panel rating`);
+      if (model.plan.auto.has(stringKey(g.name))) bits.push("matched by name");
+      return bits.length ? ` <span class="muted">(${bits.join("; ")})</span>` : "";
+    };
     const mapping = mapped.length
-      ? `<ul>${mapped.map((g) => `<li>${esc(this._stringTitle(g.name, model.strings.length))} → ${name(model.plan.byString.get(g.name))}</li>`).join("")}</ul>`
+      ? `<ul>${mapped.map((g) => `<li>${esc(this._stringTitle(g.name, model.strings.length))} → ${name(model.plan.byString.get(stringKey(g.name)))}${describe(g)}</li>`).join("")}</ul>`
       : `<p>No strings are matched to a forecast yet, so the site forecast adds up all ${model.plan.site.length}
          Forecast.Solar ${model.plan.site.length === 1 ? "entry" : "entries"}. Match each string in this card's settings
          to see a forecast per string.</p>`;
@@ -892,6 +993,7 @@ class SolarEdgeOptimizersCard extends HTMLElement {
             <em>Inverter AC limit</em> in this card's settings if the panels can produce more than the inverter.</p>`;
         }
         const from = g.source === "setting" ? "from this card's settings"
+          : g.source === "portal" ? "its maximum AC power in the SolarEdge portal"
           : g.source === "combined" ? "the inverters' ratings added up" : `read from its model, ${esc(g.source)}`;
         return `<p>Capped at ${esc(g.name)}'s ${watts(g.limit)} (${from}): the panels on it can't deliver more than
           the inverter, so their combined forecast is limited to that and each string's share is scaled down to match.</p>`;
@@ -1177,6 +1279,7 @@ class SolarEdgeOptimizersCard extends HTMLElement {
           row("Power", formatPower(item.watts)),
           row("Energy today", formatEnergy(item.energy)),
           row("vs peers", item.ratio === null ? "–" : `${Math.round(item.ratio)}%`),
+          ...(item.forecast ? [row("vs forecast", pct(item.forecast.ratio))] : []),
           row("Module", item.volts === null ? "–" : `${item.volts.toFixed(1)} V`),
           row("Health", `${status.problem ? `<ha-icon class="tone-${status.tone}" icon="${status.icon}"></ha-icon>` : ""}${esc(item.statusLabel)}`),
           row("Reported", relativeTime(item.lastAt)),
@@ -1186,6 +1289,7 @@ class SolarEdgeOptimizersCard extends HTMLElement {
           row("Energy", formatEnergy(item.energy)),
           row("Peak", item.peak === null ? "–" : formatPower(item.peak)),
           row("vs peers", item.energyRatio === null ? "–" : `${Math.round(item.energyRatio)}%`),
+          ...(item.forecast ? [row("Forecast", `${formatEnergy(item.forecast.total)} · ${pct(item.forecast.ratio)}`)] : []),
         ];
     this._showTip(ev, `<strong>${esc(item.fullName)}</strong>${rows.join("")}`);
   }
@@ -1525,14 +1629,18 @@ class SolarEdgeOptimizersCardEditor extends HTMLElement {
       this._forecasts = discoverForecasts(hass);
       loadForecastTitles(hass).then(async (titles) => {
         this._titles = titles;
-        // New Forecast.Solar entries have no name. Describe those by their
-        // planes ("30° / 180° / 4600W") so they can still be told apart.
+        // Each entry's planes are titled "30° / 180° / 4600W". They describe
+        // unnamed entries, and give each entry's size to check against the
+        // strings' panels. Listing them needs admin rights, as editing does.
         this._planes = new Map();
+        this._entryWatts = new Map();
         for (const id of this._forecasts.keys()) {
-          if (titles.get(id)) continue;
           const subentries = await hass.callWS({ type: "config_entries/subentries/list", entry_id: id }).catch(() => []);
           const planes = subentries.filter((sub) => sub.subentry_type === "plane").map((sub) => sub.title);
-          if (planes.length) this._planes.set(id, planes.join(" + "));
+          if (!planes.length) continue;
+          this._planes.set(id, planes.join(" + "));
+          const watts = planes.map((title) => parseFloat(/([\d.]+)\s*W\s*$/i.exec(title)?.[1]));
+          if (watts.every((w) => w > 0)) this._entryWatts.set(id, watts.reduce((sum, w) => sum + w, 0));
         }
         this._render();
       });
@@ -1550,7 +1658,12 @@ class SolarEdgeOptimizersCardEditor extends HTMLElement {
       if (parent) inverters.add(parent);
     }
     const models = [...inverters].map((id) => hass.devices?.[id]?.model);
-    if (models.length === 1) {
+    if (inverters.size === 1) {
+      const [inverterId] = inverters;
+      const sensor = Object.values(hass.entities || {}).find(
+        (e) => e.platform === DOMAIN && e.translation_key === "max_ac_power" && e.device_id === inverterId);
+      const reported = num(hass.states[sensor?.entity_id]);
+      if (reported) return `Detected ${reported} W from the SolarEdge portal`;
       const rating = inverterRating(models[0]);
       return rating ? `Detected ${rating} W from ${models[0]}` : "Couldn't read the rating; enter it";
     }
@@ -1571,22 +1684,55 @@ class SolarEdgeOptimizersCardEditor extends HTMLElement {
     const titles = this._titles || new Map();
     const label = (id) => titles.get(id) || (this._planes?.get(id) ? `Unnamed: ${this._planes.get(id)}` : "Unnamed Forecast.Solar entry");
     const unnamed = forecasts.some((id) => !titles.get(id));
-    const mapping = c.forecast_strings || {};
     const option = (value, label, selected) => `<option value="${esc(value)}" ${selected ? "selected" : ""}>${esc(label)}</option>`;
+    const ratings = stringRatings(this._hass);
+    const known = new Set((this._strings || []).map(stringKey));
+    const { byString, auto } = forecastMapping(c, this._forecasts || new Map(), titles, known);
+    const fmtW = (w) => `${Math.round(w).toLocaleString()} W`;
+    const ratingText = (r) => {
+      if (!r) return "";
+      if (!r.known || !r.watts) return `${r.panels} panels (rating unknown)`;
+      return r.sizes.size === 1 ? `${r.panels} panels × ${fmtW([...r.sizes][0])} = ${fmtW(r.watts)}` : `${r.panels} panels, ${fmtW(r.watts)}`;
+    };
     const stringRows = (this._strings || []).map((name) => {
-      const current = mapping[name] || "";
-      const options = [option("", "No forecast", !current), ...forecasts.map((id) =>
-        option(id, label(id), current === id || Boolean(current && titles.get(id) && titles.get(id).toLowerCase() === String(current).toLowerCase())))];
-      return `<label class="row"><span>String ${esc(name)}</span><select data-string="${esc(name)}">${options.join("")}</select></label>`;
+      const key = stringKey(name);
+      const current = byString.get(key) || "";
+      const options = [option("", "No forecast", !current), ...forecasts.map((id) => option(id, label(id), current === id))];
+      const info = [ratingText(ratings.get(key)), auto.has(key) ? "matched by the entry's name" : ""].filter(Boolean).join(" · ");
+      return `<label class="row"><span>${esc(stringLabel(name))}${info ? `<small>${esc(info)}</small>` : ""}</span>
+        <select data-string="${esc(name)}">${options.join("")}</select></label>`;
     });
+    // Each entry's size should match the panels of the strings that use it.
+    const warnings = [];
+    for (const id of forecasts) {
+      const entryW = this._entryWatts?.get(id);
+      const keys = [...byString].filter(([, entry]) => entry === id).map(([key]) => key);
+      if (!entryW || !keys.length) continue;
+      const rs = keys.map((key) => ratings.get(key));
+      if (rs.some((r) => !r?.known || !r.watts)) continue;
+      const dc = rs.reduce((sum, r) => sum + r.watts, 0);
+      if (Math.abs(entryW - dc) / dc <= 0.05) continue;
+      const names = keys.map((key) => stringLabel(ratings.get(key).name)).join(" and ");
+      warnings.push(`${esc(label(id))} is set up for ${fmtW(entryW)} of panels, but ${esc(names)} ${keys.length > 1 ? "have" : "has"}
+        ${fmtW(dc)}. In Settings → Devices &amp; services → Forecast.Solar, edit that entry's plane and set
+        <em>Total Watt peak power</em> to ${Math.round(dc)}.`);
+    }
+    const suggest = forecasts.length && !byString.size
+      ? `<p class="hint">Tip: name each Forecast.Solar entry after the string it covers (such as "${esc(stringLabel(this._strings?.[0] || "1.1"))}",
+         or "1.1 + 1.2" for strings on the same roof face) and the card matches them automatically. When setting
+         an entry up, use the panel totals shown here for <em>Total Watt peak power</em>.</p>`
+      : "";
     const forecastSection = forecasts.length
       ? `<label class="check"><input type="checkbox" data-key="forecast" ${c.forecast !== false ? "checked" : ""}> Show predicted generation</label>
-         <p class="hint">Match each string to the Forecast.Solar entry for the roof face it's on. Leave them all on
-         "No forecast" to add up every entry as a site total.</p>
+         <p class="hint">Match each string to the Forecast.Solar entry for the roof face it's on. Strings on the same
+         face can share an entry; its forecast is split by their panels' rating. Leave them all on "No forecast" to add up
+         every entry as a site total.</p>
          ${unnamed ? `<p class="hint">Some Forecast.Solar entries have no name, so they're shown as tilt / direction /
          size. To name one, open Settings → Devices &amp; services → Forecast.Solar, choose ⋮ next to the entry,
          then Rename.</p>` : ""}
-         ${stringRows.join("")}`
+         ${stringRows.join("")}
+         ${warnings.map((w) => `<p class="warn">${w}</p>`).join("")}
+         ${suggest}`
       : `<p class="hint">Predicted generation uses Home Assistant's Forecast.Solar integration, which needs an internet
          connection. Add one entry per roof face, then come back here to match them to strings.
          <a href="${SETUP_FORECAST_URL}" target="_blank" rel="noreferrer">Set up Forecast.Solar</a></p>`;
@@ -1599,6 +1745,9 @@ class SolarEdgeOptimizersCardEditor extends HTMLElement {
           border: 1px solid var(--divider-color, #ccc); background: var(--card-background-color, #fff); color: var(--primary-text-color); }
         .hint { margin: 4px 0 8px; font-size: 0.85rem; color: var(--secondary-text-color); }
         .hint a { color: var(--primary-color); }
+        .row small { display: block; font-size: 0.78rem; color: var(--secondary-text-color); }
+        .warn { margin: 6px 0; padding: 8px 10px; border-radius: 6px; font-size: 0.85rem;
+          background: color-mix(in srgb, var(--warning-color, #ffa600) 16%, transparent); color: var(--primary-text-color); }
       </style>
       <label class="field"><span>Title</span><input type="text" data-key="title" value="${esc(c.title ?? "Solar optimizers")}"></label>
       <label class="field"><span>Style</span><select data-key="style">
@@ -1612,7 +1761,8 @@ class SolarEdgeOptimizersCardEditor extends HTMLElement {
         <input type="number" min="0" step="100" data-key="inverter_power" value="${esc(typeof c.inverter_power === "number" ? c.inverter_power : "")}"
           placeholder="${esc(this._detectedLimit())}"></label>
         <p class="hint">Strings on one inverter can't produce more than it can deliver, so their combined forecast is
-        capped at its AC rating. Leave this empty to use the rating read from the inverter's model.</p>` : ""}`;
+        capped at its AC rating. Leave this empty to use the limit the SolarEdge portal reports, or the rating in the
+        inverter's model name.</p>` : ""}`;
     this.shadowRoot.querySelectorAll("[data-key]").forEach((el) => {
       el.addEventListener("change", () => {
         const key = el.dataset.key;
@@ -1626,9 +1776,12 @@ class SolarEdgeOptimizersCardEditor extends HTMLElement {
     });
     this.shadowRoot.querySelectorAll("[data-string]").forEach((el) => {
       el.addEventListener("change", () => {
-        const next = { ...(this._config.forecast_strings || {}) };
+        const next = {};
+        // Drop any other spelling of the same string ("1.1" vs "String 1.1").
+        for (const [name, value] of Object.entries(this._config.forecast_strings || {})) {
+          if (stringKey(name) !== stringKey(el.dataset.string)) next[name] = value;
+        }
         if (el.value) next[el.dataset.string] = el.value;
-        else delete next[el.dataset.string];
         this._update({ forecast_strings: Object.keys(next).length ? next : undefined });
       });
     });
