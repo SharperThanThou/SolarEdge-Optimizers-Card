@@ -11,9 +11,16 @@
  * https://github.com/SharperThanThou/SolarEdge-Optimizers-Card
  */
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 const DOMAIN = "solaredge_optimizers";
 const STATS_REFRESH_MS = 5 * 60 * 1000;
+// Forecast calibration: how far back to look, how many clear days it needs,
+// how often to look again, and how much an hour's output may vary (highest
+// minus lowest reading, as a share of the highest) and still count as clear.
+const CALIBRATION_DAYS = 21;
+const CALIBRATION_MIN_DAYS = 3;
+const CALIBRATION_REFRESH_MS = 6 * 3600 * 1000;
+const CLEAR_SPREAD = 0.35;
 
 // Sequential blue ramp (magnitude). Light mode runs light -> dark, dark mode
 // runs dark -> light so low output always recedes towards the card surface.
@@ -159,6 +166,18 @@ function median(values) {
   const sorted = [...values].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+/** The median of [{value, weight}], where each value counts by its weight. */
+function weightedMedian(samples) {
+  const sorted = samples.filter((s) => s.weight > 0).sort((a, b) => a.value - b.value);
+  const total = sorted.reduce((sum, s) => sum + s.weight, 0);
+  let acc = 0;
+  for (const s of sorted) {
+    acc += s.weight;
+    if (acc >= total / 2) return s.value;
+  }
+  return null;
 }
 
 /** Forecast.Solar entries by config entry ID, with their useful entities. */
@@ -404,6 +423,8 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     this._entityIds.push(...[...this._forecasts.values()].flatMap((f) => [f.today, f.remaining]).filter(Boolean));
     this._signature = null;
     this._days = new Map();
+    this._calib = null;
+    this._calibMemo = null;
     this._loadForecastTitles();
   }
 
@@ -468,6 +489,7 @@ class SolarEdgeOptimizersCard extends HTMLElement {
 
   _ensureDayData() {
     if (!this._hass || !this._optimizers.length) return;
+    this._ensureCalibration();
     const day = this._selectedDay();
     const key = isoDay(day);
     const cached = this._days.get(key);
@@ -509,14 +531,14 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     this._schedule();
   }
 
-  _fetchStats(ids, start, end, period) {
+  _fetchStats(ids, start, end, period, types = ["mean", "max"]) {
     return this._hass.callWS({
       type: "recorder/statistics_during_period",
       start_time: start.toISOString(),
       end_time: end.toISOString(),
       statistic_ids: ids,
       period,
-      types: ["mean", "max"],
+      types,
       units: { power: "W" },
     });
   }
@@ -548,6 +570,175 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     }
     const curve = [...totals.entries()].sort((a, b) => a[0] - b[0]).map(([t, v]) => ({ t, v }));
     return { perEntity, curve, period, lastEnd };
+  }
+
+  // ----- forecast calibration --------------------------------------------
+
+  /** Load the last few weeks of hourly statistics once a day (and every few hours). */
+  _ensureCalibration() {
+    if (this._config.forecast === false || this._config.forecast_calibration === false) return;
+    if (!this._forecasts?.size) return;
+    const key = isoDay(startOfDay(new Date()));
+    const calib = this._calib;
+    if (calib && calib.key === key && (calib.loading || Date.now() - calib.fetchedAt < CALIBRATION_REFRESH_MS)) return;
+    this._loadCalibration(key);
+  }
+
+  async _loadCalibration(key) {
+    const optimizerIds = this._optimizers.map((o) => o.power).filter(Boolean);
+    const forecastIds = [...this._forecasts.values()].map((f) => f.power).filter(Boolean);
+    if (!optimizerIds.length || !forecastIds.length) return;
+    this._calib = { ...(this._calib || {}), key, loading: true };
+    const end = startOfDay(new Date());
+    const start = addDays(end, -CALIBRATION_DAYS);
+    let rows = null;
+    try {
+      // Hourly statistics are kept long term, and their min and max show
+      // whether clouds came and went during the hour.
+      const result = await this._fetchStats([...optimizerIds, ...forecastIds], start, end, "hour", ["mean", "min", "max"]);
+      rows = new Map(Object.entries(result).map(([id, list]) => [id, new Map((list || []).map((r) => [toMs(r.start), r]))]));
+    } catch (err) {
+      console.warn("solaredge-optimizers-card: calibration statistics unavailable", err);
+    }
+    this._calib = { key, rows, fetchedAt: Date.now(), loading: false };
+    this._calibMemo = null;
+    this._schedule();
+  }
+
+  /**
+   * How far each Forecast.Solar entry's forecast is from what its strings
+   * really produce, learned from recent clear days. Forecast.Solar doesn't
+   * know about shade, dirt, wiring or the system's real efficiency, and its
+   * weather data can be off; on a clear day the difference is mostly the
+   * former, so the typical ratio on clear days is used to scale the forecast.
+   *
+   * Returns { byEntry: Map(entry ID -> factor), units: [...] } or null.
+   */
+  _calibrate(plan, strings, groups) {
+    const calib = this._calib;
+    if (this._config.forecast_calibration === false || !calib?.rows) return null;
+    const memoKey = [
+      calib.fetchedAt,
+      plan.site.join(","),
+      [...plan.byString].join(","),
+      groups.map((g) => `${g.ids.join("+")}:${g.limit}`).join(","),
+      strings.map((g) => `${g.name}:${g.list.length}:${g.dc}`).join(","),
+    ].join("|");
+    if (this._calibMemo?.key === memoKey) return this._calibMemo.value;
+
+    const rows = calib.rows;
+    const powerOf = (id) => this._forecasts.get(id)?.power;
+    const mean = (id, t) => {
+      const v = Number(rows.get(id)?.get(t)?.mean);
+      return Number.isFinite(v) ? Math.max(v, 0) : null;
+    };
+    const forecastAt = (ids, t) => ids.reduce((sum, id) => sum + (mean(powerOf(id), t) || 0), 0);
+    // With strings matched, each entry is calibrated against its strings;
+    // otherwise all the entries together against the whole site.
+    const units = plan.byString.size
+      ? plan.site.map((id) => ({ ids: [id], strings: strings.filter((g) => plan.byString.get(stringKey(g.name)) === id) }))
+      : [{ ids: [...plan.site], strings }];
+    const groupOf = new Map();
+    for (const g of groups) for (const id of g.ids) groupOf.set(id, g);
+
+    const value = { byEntry: new Map(), units: [] };
+    for (const unit of units) {
+      const items = unit.strings.flatMap((g) => g.list).filter((i) => i.power);
+      const info = { ids: unit.ids, keys: unit.strings.map((g) => stringKey(g.name)), factor: null, days: 0, clear: 0 };
+      value.units.push(info);
+      if (!items.length) continue;
+      const dc = items.every((i) => i.dc) ? items.reduce((sum, i) => sum + i.dc, 0) : null;
+      const panels = items.reduce((sum, i) => sum + i.panels, 0);
+      const share = (i) => (dc ? i.dc / dc : i.panels / panels);
+      // The optimizers behind each inverter limit that applies to this unit.
+      const limited = [...new Set(unit.ids.map((id) => groupOf.get(id)).filter((g) => g?.limit))].map((g) => ({
+        limit: g.limit,
+        powers: strings
+          .filter((s) => g.inverterId === "all" || g.inverterId === "unknown" || s.inverterId === g.inverterId)
+          .flatMap((s) => s.list.map((i) => i.power))
+          .filter(Boolean),
+      }));
+      const clipped = (t) => limited.some((g) =>
+        g.powers.reduce((sum, id) => sum + Math.max(Number(rows.get(id)?.get(t)?.max) || 0, 0), 0) >= g.limit * 0.97);
+
+      const days = new Map();
+      for (const id of unit.ids) {
+        for (const t of rows.get(powerOf(id))?.keys() || []) {
+          const day = isoDay(new Date(t));
+          if (!days.has(day)) days.set(day, new Set());
+          days.get(day).add(t);
+        }
+      }
+      const candidates = [];
+      for (const hours of days.values()) {
+        const fc = new Map();
+        for (const t of hours) {
+          // Leave out hours the inverter really did limit: the panels'
+          // output then says nothing about what they could have made.
+          if (clipped(t)) continue;
+          const v = forecastAt(unit.ids, t);
+          if (v > 0) fc.set(t, v);
+        }
+        if (!fc.size) continue;
+        const peak = Math.max(...fc.values());
+        const total = [...fc.values()].reduce((sum, v) => sum + v, 0);
+
+        // Clear: around the middle of the day, output held steady within
+        // most hours instead of dipping as clouds passed.
+        let checked = 0;
+        let steady = 0;
+        for (const [t, v] of fc) {
+          if (v < peak * 0.6) continue;
+          let hi = 0;
+          let lo = 0;
+          for (const i of items) {
+            const r = rows.get(i.power)?.get(t);
+            if (!r) continue;
+            hi += Math.max(Number(r.max) || 0, 0);
+            lo += Math.max(Number(r.min) || 0, 0);
+          }
+          if (hi <= 0) continue;
+          checked += 1;
+          if ((hi - lo) / hi <= CLEAR_SPREAD) steady += 1;
+        }
+        if (checked < 2 || steady / checked < 0.75) continue;
+
+        // Each optimizer's output against its share of the forecast. The
+        // median ignores the odd faulty or shaded panel, which the health
+        // sensors report instead.
+        const ratios = [];
+        for (const i of items) {
+          let actual = 0;
+          let expected = 0;
+          let missing = 0;
+          for (const [t, v] of fc) {
+            const m = mean(i.power, t);
+            if (m === null) {
+              if (v > peak * 0.05) missing += 1;
+              continue;
+            }
+            actual += m;
+            expected += v * share(i);
+          }
+          if (missing > fc.size * 0.1 || expected <= 0) continue;
+          ratios.push(actual / expected);
+        }
+        if (!ratios.length || ratios.length < items.length / 2) continue;
+        candidates.push({ value: median(ratios), weight: total });
+      }
+      // A clear day the forecast expected to be dull says more about the
+      // weather data than the panels; leave those out.
+      const best = Math.max(0, ...candidates.map((c) => c.weight));
+      const samples = candidates.filter((c) => c.weight >= best * 0.3);
+      info.clear = samples.length;
+      if (samples.length >= CALIBRATION_MIN_DAYS) {
+        info.factor = Math.min(Math.max(weightedMedian(samples), 0.2), 1.5);
+        info.days = samples.length;
+        for (const id of unit.ids) value.byEntry.set(id, info.factor);
+      }
+    }
+    this._calibMemo = { key: memoKey, value };
+    return value;
   }
 
   // ----- rendering -------------------------------------------------------
@@ -692,6 +883,16 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     // inverter share its AC limit. Cap their combined forecast at that limit
     // and scale each entry down in proportion.
     const groups = this._inverterGroups(plan, strings);
+    // Scale each entry by what's been learned about it, before capping: the
+    // inverter limits what the panels really produce.
+    const calibration = this._calibrate(plan, strings, groups);
+    const factorOf = (id) => calibration?.byEntry.get(id) ?? 1;
+    for (const id of plan.site) {
+      const k = factorOf(id);
+      if (k === 1) continue;
+      const points = series.get(id);
+      for (const [t, v] of points) points.set(t, v * k);
+    }
     const capped = new Map(plan.site.map((id) => [id, new Map(series.get(id))]));
     let clipping = false;
     for (const group of groups) {
@@ -726,11 +927,12 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       if (today) {
         // The sensors give the uncapped day; take off what the cap removed
         // from the part of today that's been recorded.
+        const k = factorOf(entryId);
         const total = energyWh(states[f.today]);
         const remaining = energyWh(states[f.remaining]);
         if (total === null) return { total: null, expected: null };
         const lost = integrate(raw, now) - integrate(cap, now);
-        return { total: total - lost, expected: remaining === null ? null : Math.max(total - remaining - lost, 0) };
+        return { total: total * k - lost, expected: remaining === null ? null : Math.max((total - remaining) * k - lost, 0) };
       }
       // Earlier days: add up the recorded forecast power, the same way
       // actual energy is worked out.
@@ -794,6 +996,7 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       site,
       curve,
       groups,
+      calibration,
       clipping,
       // Without the full curve, today's cap only covers what's been recorded.
       partialCap: today && !full && limited.length > 0,
@@ -972,11 +1175,17 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     const titles = this._forecastTitles || new Map();
     const name = (id) => esc(titles.get(id) || "an unnamed Forecast.Solar entry");
     const mapped = model.strings.filter((g) => model.plan.byString.has(stringKey(g.name)));
+    const calibration = model.forecast?.calibration;
+    const learned = (unit) => (unit.factor !== null
+      ? `calibrated × ${unit.factor.toFixed(2)} from ${unit.days} clear ${unit.days === 1 ? "day" : "days"}`
+      : `calibrating: ${unit.clear} of ${CALIBRATION_MIN_DAYS} clear days so far`);
     const describe = (g) => {
       const bits = [];
+      const unit = calibration?.units.find((u) => u.keys.includes(stringKey(g.name)));
       if (g.dc) bits.push(`${g.panels} panels, ${Math.round(g.dc).toLocaleString()} W`);
       if (g.forecastShare !== undefined && g.forecastShare < 1) bits.push(`${Math.round(g.forecastShare * 100)}% of it, by panel rating`);
       if (model.plan.auto.has(stringKey(g.name))) bits.push("matched by name");
+      if (unit) bits.push(learned(unit));
       return bits.length ? ` <span class="muted">(${bits.join("; ")})</span>` : "";
     };
     const mapping = mapped.length
@@ -1004,6 +1213,17 @@ class SolarEdgeOptimizersCard extends HTMLElement {
          high on days the inverter limits output. Linking the entries in the Energy dashboard (README step 5) lets the
          card cap the whole day.</p>`
       : "";
+    let calibText = "";
+    if (this._config.forecast_calibration !== false) {
+      const siteUnit = !mapped.length && calibration?.units[0];
+      calibText = `<p>Calibration: Forecast.Solar doesn't know about shade, dirt, wiring or how efficient your
+        system really is. The card compares its forecast with what the panels produced on clear days in the last
+        ${CALIBRATION_DAYS / 7} weeks, and scales the forecast by the typical difference${siteUnit ? ` (${learned(siteUnit)})` : ""}.
+        Until it has found ${CALIBRATION_MIN_DAYS} clear days, the forecast is shown as Forecast.Solar gives it.
+        ${calibration ? "" : this._calib && !this._calib.loading
+          ? "The statistics it needs couldn't be read, so the forecast isn't calibrated."
+          : "Loading the last few weeks of statistics…"}</p>`;
+    }
     const hint = model.today && model.forecast && !model.forecast.curve?.full
       ? `<p>To see the rest of today's forecast on the chart, add the Forecast.Solar entries to your solar
          panels in the Energy dashboard settings.</p>`
@@ -1013,7 +1233,7 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       <p>Downloaded by Home Assistant over the internet, based on each Forecast.Solar entry's location, tilt,
       direction and size. Today's percentage compares the energy produced so far with what the forecast expected
       by now; for an earlier day it compares the whole day.</p>
-      ${mapping}${limitText}${partial}${hint}
+      ${mapping}${calibText}${limitText}${partial}${hint}
     </div>`;
   }
 
@@ -1732,7 +1952,12 @@ class SolarEdgeOptimizersCardEditor extends HTMLElement {
          then Rename.</p>` : ""}
          ${stringRows.join("")}
          ${warnings.map((w) => `<p class="warn">${w}</p>`).join("")}
-         ${suggest}`
+         ${suggest}
+         <label class="check"><input type="checkbox" data-key="forecast_calibration" ${c.forecast_calibration !== false ? "checked" : ""}>
+           Calibrate the forecast from past clear days</label>
+         <p class="hint">Compares the forecast with what each string really produced on clear days in the last
+         ${CALIBRATION_DAYS / 7} weeks, and scales it by the typical difference. This corrects for shade, dirt and
+         losses Forecast.Solar doesn't know about. It needs ${CALIBRATION_MIN_DAYS} clear days to start.</p>`
       : `<p class="hint">Predicted generation uses Home Assistant's Forecast.Solar integration, which needs an internet
          connection. Add one entry per roof face, then come back here to match them to strings.
          <a href="${SETUP_FORECAST_URL}" target="_blank" rel="noreferrer">Set up Forecast.Solar</a></p>`;
@@ -1770,7 +1995,7 @@ class SolarEdgeOptimizersCardEditor extends HTMLElement {
         if (key === "show_weakest") value = Number(value);
         if (key === "inverter_power") value = Number(value) > 0 ? Number(value) : undefined;
         // Keep the YAML short: leave defaults out.
-        const defaults = { show_history: true, forecast: true, style: "default", show_weakest: 5, inverter_power: undefined };
+        const defaults = { show_history: true, forecast: true, forecast_calibration: true, style: "default", show_weakest: 5, inverter_power: undefined };
         this._update({ [key]: defaults[key] === value ? undefined : value });
       });
     });

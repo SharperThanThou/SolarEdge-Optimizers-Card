@@ -87,6 +87,7 @@ It's a single-card *panel* view, so the map uses the full width.
 | `forecast` | `true` | Show predicted generation when Forecast.Solar is set up. `false` hides it. |
 | `inverter_power` | (from the model) | The inverter's AC limit in W, which caps the combined forecast of the strings on it. Normally read from the inverter's model. A number applies to every inverter; for several, use `{"Inverter name": watts}`. See [Strings sharing an inverter](#strings-sharing-an-inverter). |
 | `forecast_strings` | (none) | Which Forecast.Solar entry belongs to each string, by entry name or ID. See [step 4](#step-4-match-each-string-to-its-forecast). |
+| `forecast_calibration` | `true` | Scale each forecast by how it compared with what the panels really produced on recent clear days. `false` shows Forecast.Solar's figures unchanged. See [Calibration](#calibration). |
 | `forecast_match_names` | `true` | Match Forecast.Solar entries named after strings (such as *1.1* or *1.1 + 1.2*) automatically. `false` turns that off. |
 
 All of these can also be set in the card's visual editor.
@@ -140,6 +141,8 @@ from the portal, so the card already knows:
   of the forecast.
 - **The inverter's AC limit**, for capping the forecast (see
   [Strings sharing an inverter](#strings-sharing-an-inverter)).
+- **How far off each forecast usually is**, learned from recent clear days
+  (see [Calibration](#calibration)).
 
 What it can't know is each roof face's tilt and direction, which is why the
 Forecast.Solar entries are still needed.
@@ -299,6 +302,45 @@ If you leave every string unmatched, the card treats all Forecast.Solar
 entries as one site forecast and caps it at the inverter's rating, or at the
 inverters' ratings added up if there are several.
 
+### Calibration
+
+Forecast.Solar works from your location, the roof's tilt and direction, the
+panels' size and a weather forecast. It doesn't know about trees or chimneys
+shading the roof, dirty panels, wiring losses, or how efficient your panels
+and inverter really are, so its forecast can be well above what your system
+ever makes (or, less often, below).
+
+The card corrects for this by itself. Once a day it looks back over the last
+3 weeks and, for each Forecast.Solar entry:
+
+1. **Finds the clear days.** A clear day is one where output held steady
+   through each hour around the middle of the day, instead of dipping as
+   clouds passed. Home Assistant's hourly statistics record each hour's
+   lowest and highest reading, which shows this. Days the forecast itself
+   expected to be dull are left out too.
+2. **Compares each optimizer with its share of the forecast** on those days.
+   The middle value is used, so a faulty or shaded panel doesn't skew it; the
+   health sensors report those instead.
+3. **Scales the forecast** by the typical ratio across the clear days. A
+   forecast that's usually 40% too high is multiplied by about 0.7.
+
+Hours when the panels were really held back by the inverter's limit are left
+out, since they don't show what the panels could have made.
+
+It needs 3 clear days before it starts. Until then the forecast is shown as
+Forecast.Solar gives it. Click **Forecast** to see each string's factor, such
+as *calibrated × 0.68 from 7 clear days*, or how many clear days have been
+found so far. The factor is kept between 0.2 and 1.5, and the same factor
+applies to earlier days, so they compare like with like.
+
+The calibration uses the history Home Assistant has already recorded, so it
+works straight away if Forecast.Solar has been running for a while. If you
+change an entry's tilt, direction or size, its calibration catches up over the
+following weeks.
+
+To see Forecast.Solar's figures unchanged, untick **Calibrate the forecast
+from past clear days** in the editor, or set `forecast_calibration: false`.
+
 ### What you'll see
 
 - **Forecast**, next to the day's energy: the forecast total for the day.
@@ -313,9 +355,10 @@ inverters' ratings added up if there are several.
   compare actual and forecast at any time.
 - **Click Forecast** to see which forecast each string uses.
 
-Forecasts are approximate: Forecast.Solar doesn't see local cloud, shading or
-dirty panels. Compare strings against their forecast over several days rather
-than reading much into a single cloudy one.
+Forecasts are approximate. Calibration takes care of shading and losses that
+are the same every day, but not of a cloudy day the weather forecast missed.
+Compare strings against their forecast over several days rather than reading
+much into a single cloudy one.
 
 Earlier days only have a forecast from when you set Forecast.Solar up, because
 the card uses what Home Assistant recorded at the time.
@@ -333,6 +376,8 @@ within it.
 | Forecast is *–* | The entry's sensors aren't reporting yet, or Home Assistant can't reach forecast.solar. Check the entry on the Forecast.Solar page. |
 | The dashed line stops at the current time | Expected without step 5. |
 | Percentages look far off for one string | Check that string's entry: tilt, direction and especially size. A wrong size shifts the percentage in proportion. The editor warns when an entry's size doesn't match its strings' panels. |
+| Forecast is far above what you produce, even on clear days | Check the Forecast note: calibration needs 3 clear days in the last 3 weeks before it applies. If it says *calibrating*, it hasn't found them yet. Also check the entry's size and direction (step 1). |
+| *calibrating: 0 of 3 clear days* for weeks | Hours with no statistics, or a long run of cloudy weather. The optimizers' power sensors need long-term statistics, which they have by default. |
 | The editor shows no panel ratings | Update the SolarEdge Optimizers integration to 0.2 or later and restart Home Assistant. |
 | Forecast flattens at the inverter limit | Expected on bright days: see [Strings sharing an inverter](#strings-sharing-an-inverter). |
 | *rating couldn't be read* in the Forecast note | Set **Inverter AC limit (W)** in the card's editor. |
