@@ -109,8 +109,21 @@ function formatEnergy(wh) {
   return `${kwh.toFixed(digits)} kWh`;
 }
 
+const FORECAST_DOMAIN = "forecast_solar";
+const SETUP_FORECAST_URL = "https://my.home-assistant.io/redirect/config_flow_start/?domain=forecast_solar";
+
+/** An energy sensor's state in Wh, whatever unit it's displayed in. */
+function energyWh(state) {
+  const value = num(state);
+  if (value === null) return null;
+  const unit = state.attributes?.unit_of_measurement;
+  return unit === "kWh" ? value * 1000 : unit === "MWh" ? value * 1e6 : value;
+}
+
+const pct = (value) => (value === null || value === undefined || !Number.isFinite(value) ? "–" : `${Math.round(value)}%`);
+
 // "25.0 kWh" -> "25.0<small> kWh</small>", for big figures.
-const smallUnit = (text) => String(text).replace(/^([^\s]+)\s+(\S+)$/, "$1<small> $2</small>");
+const smallUnit = (text) => String(text).replace(/^(\S+)\s+([kM]?Wh?)$/, "$1<small> $2</small>");
 
 const toMs = (value) => (typeof value === "number" ? (value < 1e12 ? value * 1000 : value) : Date.parse(value));
 
@@ -136,6 +149,43 @@ function median(values) {
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
+/** Forecast.Solar entries by config entry ID, with their useful entities. */
+function discoverForecasts(hass) {
+  const forecasts = new Map();
+  for (const entry of Object.values(hass.entities || {})) {
+    if (entry.platform !== FORECAST_DOMAIN || !entry.device_id) continue;
+    const entryId = hass.devices?.[entry.device_id]?.config_entries?.[0] || entry.device_id;
+    if (!forecasts.has(entryId)) forecasts.set(entryId, { entryId, deviceId: entry.device_id });
+    const forecast = forecasts.get(entryId);
+    if (entry.translation_key === "energy_production_today") forecast.today = entry.entity_id;
+    if (entry.translation_key === "energy_production_today_remaining") forecast.remaining = entry.entity_id;
+    if (entry.translation_key === "power_production_now") forecast.power = entry.entity_id;
+  }
+  return forecasts;
+}
+
+/** Forecast.Solar entry titles. Every entry's device has the same name, so
+ * the title the user gave the entry is the only way to tell them apart. */
+async function loadForecastTitles(hass) {
+  try {
+    const entries = await hass.callWS({ type: "config_entries/get", domain: FORECAST_DOMAIN });
+    return new Map(entries.map((e) => [e.entry_id, e.title]));
+  } catch (err) {
+    return new Map();
+  }
+}
+
+/** String names reported by the optimizers' health sensors. */
+function discoverStrings(hass) {
+  const names = new Set();
+  for (const entry of Object.values(hass.entities || {})) {
+    if (entry.platform !== DOMAIN || entry.translation_key !== "health") continue;
+    const name = hass.states[entry.entity_id]?.attributes.string;
+    if (name) names.add(String(name));
+  }
+  return [...names].sort(naturalCompare);
+}
+
 class SolarEdgeOptimizersCard extends HTMLElement {
   constructor() {
     super();
@@ -151,6 +201,10 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     return {};
   }
 
+  static getConfigElement() {
+    return document.createElement("solaredge-optimizers-card-editor");
+  }
+
   setConfig(config) {
     this._config = {
       title: "Solar optimizers",
@@ -158,6 +212,8 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       show_weakest: 5,
       style: "default",
       lcars_font: true,
+      forecast: true,
+      forecast_strings: {},
       ...config,
     };
     this._signature = null;
@@ -257,10 +313,42 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       this._sites = [...sites.values()];
       this._optimizers = optimizers;
     }
+    this._forecasts = discoverForecasts(hass);
     this._entityIds = this._optimizers.flatMap((o) => [o.health, o.power, o.ratio, o.last]).filter(Boolean);
     this._entityIds.push(...this._sites.flatMap((s) => [s.problem, s.latest]).filter(Boolean));
+    this._entityIds.push(...[...this._forecasts.values()].flatMap((f) => [f.today, f.remaining]).filter(Boolean));
     this._signature = null;
     this._days = new Map();
+    this._loadForecastTitles();
+  }
+
+  async _loadForecastTitles() {
+    if (!this._forecasts.size) return;
+    this._forecastTitles = await loadForecastTitles(this._hass);
+    this._schedule();
+  }
+
+  /** Which Forecast.Solar entries feed the site total and each string. */
+  _forecastPlan() {
+    const entries = this._forecasts || new Map();
+    const available = entries.size > 0;
+    if (this._config.forecast === false || !available) return { enabled: false, available, site: [], byString: new Map() };
+    const titles = this._forecastTitles || new Map();
+    const resolve = (value) => {
+      if (!value) return null;
+      if (entries.has(value)) return value;
+      const want = String(value).trim().toLowerCase();
+      for (const [id, title] of titles) if (entries.has(id) && title.trim().toLowerCase() === want) return id;
+      return null;
+    };
+    const byString = new Map();
+    for (const [name, value] of Object.entries(this._config.forecast_strings || {})) {
+      const id = resolve(value);
+      if (id) byString.set(String(name), id);
+    }
+    // Without a mapping, assume every Forecast.Solar entry describes this site.
+    const site = byString.size ? [...new Set(byString.values())] : [...entries.keys()];
+    return { enabled: true, available, site, byString };
   }
 
   _deviceName(deviceId) {
@@ -316,8 +404,10 @@ class SolarEdgeOptimizersCard extends HTMLElement {
   }
 
   async _loadDay(key, day, today, previous) {
-    const ids = this._optimizers.map((o) => o.power).filter(Boolean);
-    if (!ids.length) return;
+    const optimizerIds = this._optimizers.map((o) => o.power).filter(Boolean);
+    if (!optimizerIds.length) return;
+    const forecastIds = [...(this._forecasts?.values() || [])].map((f) => f.power).filter(Boolean);
+    const ids = [...optimizerIds, ...forecastIds];
     this._days.set(key, { ...(previous || {}), loading: true });
     const start = day;
     const end = today ? new Date() : addDays(day, 1);
@@ -331,7 +421,12 @@ class SolarEdgeOptimizersCard extends HTMLElement {
         period = "hour";
         result = await this._fetchStats(ids, start, end, period);
       }
-      data = this._summariseStats(result, ids, period);
+      data = this._summariseStats(result, ids, period, new Set(optimizerIds));
+      if (today && forecastIds.length) {
+        // The full curve for the rest of today is only offered for forecast
+        // entries that are linked to solar panels in the Energy dashboard.
+        data.solar = await this._hass.callWS({ type: "energy/solar_forecast" }).catch(() => null);
+      }
     } catch (err) {
       console.warn("solaredge-optimizers-card: statistics unavailable", err);
       data = { error: true, perEntity: new Map(), curve: [], period: null, lastEnd: start.getTime() };
@@ -352,7 +447,7 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     });
   }
 
-  _summariseStats(result, ids, period) {
+  _summariseStats(result, ids, period, optimizerIds) {
     const perEntity = new Map();
     const totals = new Map();
     let lastEnd = 0;
@@ -369,8 +464,10 @@ class SolarEdgeOptimizersCard extends HTMLElement {
         energy += (Math.max(mean, 0) * (end - start)) / 3600000;
         peak = Math.max(peak, Number(row.max) || mean);
         series.set(start, mean);
-        totals.set(start, (totals.get(start) || 0) + mean);
-        lastEnd = Math.max(lastEnd, end);
+        if (optimizerIds.has(id)) {
+          totals.set(start, (totals.get(start) || 0) + mean);
+          lastEnd = Math.max(lastEnd, end);
+        }
         rows += 1;
       }
       perEntity.set(id, rows ? { energy, peak, series } : null);
@@ -457,6 +554,10 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       }
     }
 
+    const energy = ready ? items.reduce((sum, i) => sum + (i.energy || 0), 0) : null;
+    const plan = this._forecastPlan();
+    const forecast = plan.enabled ? this._forecastModel(plan, { today, day, stats, ready, strings, energy }) : null;
+
     const curve = ready ? [...stats.curve] : null;
     if (curve && today) curve.push({ t: now, v: items.reduce((sum, i) => sum + (i.watts || 0), 0) });
     const scaleMax = today
@@ -474,9 +575,78 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       scaleMax,
       latest,
       curve,
-      energy: ready ? items.reduce((sum, i) => sum + (i.energy || 0), 0) : null,
+      energy,
+      plan,
+      forecast,
       peak: curve && curve.length ? Math.max(...curve.map((p) => p.v)) : null,
     };
+  }
+
+  _forecastModel(plan, { today, day, stats, ready, strings, energy }) {
+    const states = this._hass.states;
+    const dayStart = day.getTime();
+    const dayEnd = addDays(day, 1).getTime();
+    const figures = (entryId) => {
+      const f = this._forecasts.get(entryId);
+      if (!f) return null;
+      if (today) {
+        const total = energyWh(states[f.today]);
+        const remaining = energyWh(states[f.remaining]);
+        return { total, expected: total !== null && remaining !== null ? Math.max(total - remaining, 0) : null };
+      }
+      // Earlier days: add up the recorded forecast power, the same way
+      // actual energy is worked out.
+      const stat = ready ? stats.perEntity.get(f.power) : undefined;
+      return { total: ready && stat ? stat.energy : null, expected: null };
+    };
+    const combine = (ids) => {
+      const figs = ids.map(figures).filter(Boolean);
+      if (!figs.length || figs.some((f) => f.total === null)) return { total: null, expected: null };
+      return {
+        total: figs.reduce((sum, f) => sum + f.total, 0),
+        expected: figs.every((f) => f.expected !== null) ? figs.reduce((sum, f) => sum + f.expected, 0) : null,
+      };
+    };
+    // Today compares with what the forecast expected by now, earlier days
+    // with the whole day's forecast. Ignore tiny bases around sunrise.
+    const withRatio = (fig, actual) => {
+      const base = today ? fig.expected : fig.total;
+      return { ...fig, ratio: actual !== null && base !== null && base > 50 ? (actual / base) * 100 : null };
+    };
+    const site = withRatio(combine(plan.site), energy);
+    for (const group of strings) {
+      const id = plan.byString.get(group.name);
+      group.forecast = id ? withRatio(combine([id]), group.energy) : null;
+      group.forecastTitle = id ? this._forecastTitles?.get(id) : null;
+    }
+
+    let curve = null;
+    const solar = stats?.solar;
+    if (today && solar && plan.site.every((id) => solar[id]?.wh_hours)) {
+      const totals = new Map();
+      for (const id of plan.site) {
+        for (const [iso, wh] of Object.entries(solar[id].wh_hours)) {
+          const t = Date.parse(iso);
+          if (t >= dayStart && t < dayEnd) totals.set(t, (totals.get(t) || 0) + wh);
+        }
+      }
+      // Hourly energy in Wh is also the hour's mean power in W.
+      curve = { points: [...totals.entries()].sort((a, b) => a[0] - b[0]).map(([t, v]) => ({ t, v })), step: 3600000, full: true };
+    } else if (ready) {
+      const totals = new Map();
+      for (const id of plan.site) {
+        const power = this._forecasts.get(id)?.power;
+        for (const [t, v] of stats.perEntity.get(power)?.series || []) totals.set(t, (totals.get(t) || 0) + v);
+      }
+      if (totals.size) {
+        curve = {
+          points: [...totals.entries()].sort((a, b) => a[0] - b[0]).map(([t, v]) => ({ t, v })),
+          step: stats.period === "hour" ? 3600000 : 300000,
+          full: false,
+        };
+      }
+    }
+    return { site, curve };
   }
 
   _render() {
@@ -535,10 +705,12 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       return;
     }
     const stroke = dark ? "#3987e5" : "#2a78d6";
+    const forecastStroke = dark ? "#d95926" : "#eb6834";
     this._shell.innerHTML = [
       `<div class="head">${this._config.title ? `<h1 class="title">${esc(this._config.title)}</h1>` : ""}${this._renderNav(model)}</div>`,
       this._renderStats(model),
-      this._config.show_history ? this._renderHistory(model, stroke, this._width - 32) : "",
+      this._renderForecastNote(model),
+      this._config.show_history ? this._renderHistory(model, stroke, forecastStroke, this._width - 32) : "",
       this._renderMap(model, ramp),
       this._renderWeakest(model, ramp),
     ].join("");
@@ -574,6 +746,54 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     };
   }
 
+  /** The forecast figure for the summary, or null when it's switched off. */
+  _forecastSummary(model) {
+    const { plan, forecast } = model;
+    if (this._config.forecast === false) return null;
+    if (!plan.available) return { label: "Forecast", value: "Set up", sub: "Needs internet" };
+    const site = forecast?.site;
+    const value = site?.total === null || site?.total === undefined ? "–" : formatEnergy(site.total);
+    const sub = site?.ratio === null || site?.ratio === undefined
+      ? ""
+      : model.today ? `${pct(site.ratio)} of expected` : `Actual ${pct(site.ratio)}`;
+    return { label: "Forecast", value, sub };
+  }
+
+  _renderForecastNote(model) {
+    if (!this._noteOpen || this._config.forecast === false) return "";
+    const close = `<button class="note-close" data-action="forecast" aria-label="Close">×</button>`;
+    if (!model.plan.available) {
+      return `<div class="note-panel" role="note">${close}
+        <strong>Predicted generation needs an internet connection.</strong>
+        <p>It comes from Home Assistant's Forecast.Solar integration, which downloads a forecast from
+        forecast.solar using your home's location (Settings → System → General) and the tilt, direction
+        and size of your panels. This card doesn't contact anything itself.</p>
+        <p>Add one Forecast.Solar entry per roof face, then choose which entry belongs to each string in
+        this card's settings.</p>
+        <p><a href="${SETUP_FORECAST_URL}" target="_blank" rel="noreferrer">Set up Forecast.Solar</a></p>
+      </div>`;
+    }
+    const titles = this._forecastTitles || new Map();
+    const name = (id) => esc(titles.get(id) || "Forecast.Solar entry");
+    const mapped = model.strings.filter((g) => model.plan.byString.has(g.name));
+    const mapping = mapped.length
+      ? `<ul>${mapped.map((g) => `<li>${esc(this._stringTitle(g.name, model.strings.length))} → ${name(model.plan.byString.get(g.name))}</li>`).join("")}</ul>`
+      : `<p>No strings are matched to a forecast yet, so the site forecast adds up all ${model.plan.site.length}
+         Forecast.Solar ${model.plan.site.length === 1 ? "entry" : "entries"}. Match each string in this card's settings
+         to see a forecast per string.</p>`;
+    const hint = model.today && model.forecast && !model.forecast.curve?.full
+      ? `<p>To see the rest of today's forecast on the chart, add the Forecast.Solar entries to your solar
+         panels in the Energy dashboard settings.</p>`
+      : "";
+    return `<div class="note-panel" role="note">${close}
+      <strong>Predicted generation from Forecast.Solar</strong>
+      <p>Downloaded by Home Assistant over the internet, based on your home's location and each entry's tilt,
+      direction and size. Today's percentage compares the energy produced so far with what the forecast expected
+      by now; for an earlier day it compares the whole day.</p>
+      ${mapping}${hint}
+    </div>`;
+  }
+
   _energyText(model) {
     if (model.error) return "–";
     return model.ready ? formatEnergy(model.energy) : "…";
@@ -585,9 +805,17 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     const alert = sum.problems.length ? `background:${TONE[sum.tone]}` : `background:${LCARS.blue}`;
     const block = (label, value, style, cls = "") =>
       `<div class="lc-block ${cls}" style="${style}"><span class="lc-label">${label}</span><span class="lc-value">${smallUnit(value)}</span></div>`;
+    const fc = this._forecastSummary(model);
+    const fcBlock = fc
+      ? `<div class="lc-block forecast" style="background:${LCARS.blue}" data-action="forecast" tabindex="0" role="button"
+           aria-expanded="${Boolean(this._noteOpen)}">
+           <span class="lc-label">${fc.label}</span><span class="lc-value">${smallUnit(fc.value)}</span>
+           ${fc.sub ? `<span class="lc-sub">${esc(fc.sub)}</span>` : ""}</div>`
+      : "";
     const blocks = model.today
       ? [
           block("Energy today", this._energyText(model), `background:${LCARS.orange}`, "lead"),
+          fcBlock,
           block("Output now", formatPower(sum.total), `background:${LCARS.lavender}`),
           block("Producing", `${sum.producing}/${model.items.length}`, `background:${LCARS.peach}`),
           block("Problems", sum.problems.length, alert, sum.tone === "critical" ? "alert" : ""),
@@ -595,6 +823,7 @@ class SolarEdgeOptimizersCard extends HTMLElement {
         ]
       : [
           block(`Energy · ${esc(this._dayLabel(model))}`, this._energyText(model), `background:${LCARS.orange}`, "lead"),
+          fcBlock,
           block("Peak output", model.peak === null ? "–" : formatPower(model.peak), `background:${LCARS.lavender}`),
           block("Produced", model.ready ? `${sum.produced}/${model.items.length}` : "…", `background:${LCARS.peach}`),
         ];
@@ -607,7 +836,8 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       </div>
       <div class="lc-main">
         ${this._renderNav(model)}
-        ${this._config.show_history ? this._renderHistory(model, LCARS.orange, this._width - side - 46) : ""}
+        ${this._renderForecastNote(model)}
+        ${this._config.show_history ? this._renderHistory(model, LCARS.orange, LCARS.lavender, this._width - side - 46) : ""}
         ${this._renderMap(model, ramp)}
         ${this._renderWeakest(model, ramp)}
       </div>
@@ -622,9 +852,16 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     const { total, producing, produced, problems, tone: problemTone, latest } = this._summary(model);
     const n = model.items.length;
     const stat = (label, value, cls = "") => `<div class="stat ${cls}"><div class="label">${label}</div><div class="value">${smallUnit(value)}</div></div>`;
+    const fc = this._forecastSummary(model);
+    const fcStat = fc
+      ? `<div class="stat forecast" data-action="forecast" tabindex="0" role="button" aria-expanded="${Boolean(this._noteOpen)}">
+           <div class="label">${fc.label}<ha-icon icon="mdi:information-outline"></ha-icon></div>
+           <div class="value">${smallUnit(fc.value)}</div>${fc.sub ? `<div class="sub">${esc(fc.sub)}</div>` : ""}</div>`
+      : "";
     const stats = model.today
       ? [
           stat("Energy today", this._energyText(model), "lead"),
+          fcStat,
           stat("Output now", formatPower(total)),
           stat("Producing", `${producing}<span class="of"> / ${n}</span>`),
           stat("Problems", `<ha-icon class="tone-${problemTone}" icon="${problems.length ? "mdi:alert-circle" : "mdi:check-circle"}"></ha-icon>${problems.length}`),
@@ -632,6 +869,7 @@ class SolarEdgeOptimizersCard extends HTMLElement {
         ]
       : [
           stat(`Energy · ${esc(this._dayLabel(model))}`, this._energyText(model), "lead"),
+          fcStat,
           stat("Peak output", model.peak === null ? "–" : formatPower(model.peak)),
           stat("Produced", model.ready ? `${produced}<span class="of"> / ${n}</span>` : "…"),
         ];
@@ -674,11 +912,16 @@ class SolarEdgeOptimizersCard extends HTMLElement {
           ${main}
         </div>`;
       });
-      const figures = today
+      let figures = today
         ? `<span class="fig"><span class="fig-label">now</span>${formatPower(group.watts)}</span>
            <span class="fig"><span class="fig-label">today</span>${group.energy === null ? "…" : formatEnergy(group.energy)}</span>`
         : `<span class="fig"><span class="fig-label">energy</span>${group.energy === null ? "…" : formatEnergy(group.energy)}</span>
            <span class="fig"><span class="fig-label">peak</span>${group.peak === null ? "–" : formatPower(group.peak)}</span>`;
+      if (group.forecast) {
+        const total = group.forecast.total === null ? "–" : formatEnergy(group.forecast.total);
+        const ratio = group.forecast.ratio === null ? "" : ` · ${pct(group.forecast.ratio)}`;
+        figures += `<span class="fig" title="${esc(group.forecastTitle || "Forecast.Solar")}"><span class="fig-label">forecast</span>${total}${ratio}</span>`;
+      }
       return `<section class="string">
         <div class="string-head"><span class="string-name">${esc(this._stringTitle(group.name, strings.length))}
           <span class="muted count">${group.list.length}</span></span>
@@ -732,8 +975,13 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     return `${head}<div class="rows">${rows.join("")}</div><p class="muted note">${note}</p>`;
   }
 
-  _renderHistory(model, stroke, available) {
-    const head = `<h2 class="sub">Output · ${esc(this._dayLabel(model))}</h2>`;
+  _renderHistory(model, stroke, forecastStroke, available) {
+    const fcurve = model.forecast?.curve;
+    const legend = fcurve
+      ? `<span class="chart-legend"><span class="key"><span class="swatch" style="background:${stroke}"></span>Actual</span>
+         <span class="key"><span class="swatch dashed" style="border-color:${forecastStroke}"></span>Forecast</span></span>`
+      : "";
+    const head = `<h2 class="sub">Output · ${esc(this._dayLabel(model))}${legend}</h2>`;
     const points = model.curve;
     if (!points) return `${head}<div class="chart placeholder muted">${model.error ? "Statistics unavailable." : "Loading…"}</div>`;
     if (!points.length || (points.length === 1 && !points[0].v)) {
@@ -747,7 +995,8 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     const dayStart = model.day.getTime();
     const dayEnd = addDays(model.day, 1).getTime();
     const peak = Math.max(...points.map((p) => p.v));
-    const yMax = niceMax(peak * 1.05);
+    const fpoints = fcurve ? fcurve.points.map((p) => ({ t: p.t + fcurve.step / 2, v: p.v })) : [];
+    const yMax = niceMax(Math.max(peak, ...fpoints.map((p) => p.v)) * 1.05);
     const step = model.period === "hour" ? 3600000 : 300000;
     // Each statistic covers [t, t + step); plot it at the middle.
     const plotted = points.map((p, i) => ({ t: model.today && i === points.length - 1 ? p.t : p.t + step / 2, v: p.v }));
@@ -762,12 +1011,17 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     const ticks = [0, 6, 12, 18, 24]
       .map((h) => `<text x="${x(dayStart + h * 3600 * 1000)}" y="${height - 6}" text-anchor="middle" class="axis">${String(h % 24).padStart(2, "0")}:00</text>`)
       .join("");
-    this._chartGeom = { points: plotted, x, y, pad, dayStart, dayEnd, innerW, step };
+    const fline = fpoints.length
+      ? `<path d="${fpoints.map((p, i) => `${i ? "L" : "M"}${x(p.t).toFixed(1)},${y(p.v).toFixed(1)}`).join("")}"
+           fill="none" stroke="${forecastStroke}" stroke-width="2" stroke-dasharray="5 4" stroke-linejoin="round"/>`
+      : "";
+    this._chartGeom = { points: plotted, fpoints, fstep: fcurve?.step, x, y, pad, dayStart, dayEnd, innerW, step };
     const note = model.period === "hour" ? `<p class="muted note">Hourly averages: five-minute detail is no longer kept for this day.</p>` : "";
     return `${head}<div class="chart" data-chart="1">
       <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="Total optimizer output, peak ${formatPower(peak)}">
         ${grid}${ticks}
         <path d="${area}" fill="${stroke}" opacity="0.16"/>
+        ${fline}
         <path d="${line}" fill="none" stroke="${stroke}" stroke-width="2" stroke-linejoin="round"/>
         <line class="cross" x1="0" x2="0" y1="${pad.t}" y2="${pad.t + innerH}" visibility="hidden"/>
         <circle class="cross-dot" r="4" fill="${stroke}" visibility="hidden"/>
@@ -816,12 +1070,16 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     const rect = svg.getBoundingClientRect();
     const px = ev.clientX - rect.left;
     const t = g.dayStart + ((px - g.pad.l) / g.innerW) * (g.dayEnd - g.dayStart);
-    if (px < g.pad.l || t > g.points.at(-1).t + g.step || t < g.points[0].t - g.step) {
+    const lastT = Math.max(g.points.at(-1).t, g.fpoints.at(-1)?.t ?? 0);
+    if (px < g.pad.l || t > lastT + g.step || t < g.dayStart) {
       this._hideTip();
       return;
     }
-    let best = g.points[0];
-    for (const p of g.points) if (Math.abs(p.t - t) < Math.abs(best.t - t)) best = p;
+    const nearest = (pts) => pts.reduce((a, p) => (!a || Math.abs(p.t - t) < Math.abs(a.t - t) ? p : a), null);
+    let best = nearest(g.points);
+    const fc = g.fpoints.length ? nearest(g.fpoints) : null;
+    const actualHere = best && Math.abs(best.t - t) <= g.step;
+    if (!actualHere && fc) best = { t: fc.t, v: null };
     const cx = g.x(best.t);
     const cross = svg.querySelector(".cross");
     const dot = svg.querySelector(".cross-dot");
@@ -829,10 +1087,13 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     cross.setAttribute("x2", cx);
     cross.setAttribute("visibility", "visible");
     dot.setAttribute("cx", cx);
-    dot.setAttribute("cy", g.y(best.v));
-    dot.setAttribute("visibility", "visible");
+    dot.setAttribute("cy", g.y(best.v ?? 0));
+    dot.setAttribute("visibility", best.v === null ? "hidden" : "visible");
     const time = new Date(best.t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    this._showTip(ev, `<div class="tip-row"><span>${time}</span><strong>${formatPower(best.v)}</strong></div>`);
+    const fcHere = fc && Math.abs(fc.t - best.t) <= (g.fstep || g.step) / 2 + 1 ? fc : null;
+    this._showTip(ev, `<strong>${time}</strong>
+      ${best.v === null ? "" : `<div class="tip-row"><span>Actual</span><span>${formatPower(best.v)}</span></div>`}
+      ${fcHere ? `<div class="tip-row"><span>Forecast</span><span>${formatPower(fcHere.v)}</span></div>` : ""}`);
   }
 
   _showTip(ev, html) {
@@ -856,6 +1117,13 @@ class SolarEdgeOptimizersCard extends HTMLElement {
   }
 
   _click(ev) {
+    const action = ev.target.closest?.("[data-action]");
+    if (action?.dataset.action === "forecast") {
+      if (ev.target.closest("a")) return;
+      this._noteOpen = !this._noteOpen;
+      this._schedule();
+      return;
+    }
     const nav = ev.target.closest?.("[data-nav]");
     if (nav) {
       if (nav.disabled) return;
@@ -975,6 +1243,23 @@ const STYLES = `
   .tip-row span:last-child { display: inline-flex; align-items: center; gap: 4px; font-variant-numeric: tabular-nums; }
   .tip ha-icon { --mdc-icon-size: 14px; }
   .rule { display: none; }
+
+  .stat.forecast { cursor: pointer; outline: none; }
+  .stat.forecast:hover, .stat.forecast:focus-visible { box-shadow: inset 0 0 0 2px var(--divider-color); }
+  .stat .label ha-icon { --mdc-icon-size: 14px; margin-left: 4px; vertical-align: -2px; opacity: 0.7; }
+  .stat .sub { font-size: 0.75rem; color: var(--secondary-text-color); }
+  .note-panel { position: relative; margin: 12px 0 0; padding: 12px 36px 12px 14px; border-radius: 12px; font-size: 0.85rem;
+    line-height: 1.45; background: var(--secondary-background-color); color: var(--primary-text-color); }
+  .note-panel p { margin: 6px 0 0; }
+  .note-panel ul { margin: 6px 0 0; padding-left: 18px; }
+  .note-panel a { color: var(--primary-color); font-weight: 500; }
+  .note-close { position: absolute; top: 6px; right: 6px; width: 28px; height: 28px; border: none; border-radius: 14px;
+    background: transparent; color: var(--secondary-text-color); font-size: 1.2rem; cursor: pointer; }
+  .note-close:hover { background: var(--divider-color); }
+  .chart-legend { display: inline-flex; gap: 12px; margin-left: 12px; font-size: 0.75rem; font-weight: 400; color: var(--secondary-text-color); }
+  .chart-legend .key { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { display: inline-block; width: 16px; height: 2px; border-radius: 1px; }
+  .swatch.dashed { height: 0; border-top: 2px dashed; background: none; }
   .narrow .row { grid-template-columns: minmax(40px, auto) 1fr 40px 18px; }
   .narrow .row-label { display: none; }
   .narrow .lc-title { font-size: 1.35rem; margin-top: -1px; }
@@ -1044,6 +1329,15 @@ const STYLES = `
   .lcars .tile .kwh { font-size: 0.7rem; margin-top: 0; line-height: 1; }
   .lcars .tile.past .watts { font-size: 1rem; }
   .lc-fill { flex: 1; min-height: 24px; }
+  .lc-block.forecast { cursor: pointer; outline: none; }
+  .lc-block.forecast:hover, .lc-block.forecast:focus-visible { filter: brightness(1.12); }
+  .lc-sub { font-size: 0.68rem; line-height: 1.1; text-align: right; }
+  .lcars .note-panel { background: #000; border: 2px solid var(--lc-blue); border-radius: 0 16px 16px 0; color: var(--lc-peach); }
+  .lcars .note-panel strong { color: var(--lc-blue); font-weight: 400; }
+  .lcars .note-panel a { color: var(--lc-orange); }
+  .lcars .note-close { color: var(--lc-blue); }
+  .lcars .chart-legend { color: var(--lc-lavender); }
+  .lcars .sub { flex-wrap: wrap; }
   .lc-main { padding: 6px 2px 10px 18px; min-width: 0; }
 
   .lcars .sub, .lcars .string-head { display: flex; align-items: center; gap: 8px; font-weight: 400; }
@@ -1080,6 +1374,104 @@ const STYLES = `
   .lcars .chart.placeholder { color: var(--lc-lavender); }
 `;
 
+/**
+ * Visual editor. Uses plain form controls so it doesn't depend on Home
+ * Assistant's internal editor components.
+ */
+class SolarEdgeOptimizersCardEditor extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: "open" });
+    this._config = {};
+  }
+
+  setConfig(config) {
+    this._config = { ...config };
+    this._render();
+  }
+
+  set hass(hass) {
+    const first = !this._hass;
+    this._hass = hass;
+    if (first) {
+      this._strings = discoverStrings(hass);
+      this._forecasts = discoverForecasts(hass);
+      loadForecastTitles(hass).then((titles) => {
+        this._titles = titles;
+        this._render();
+      });
+      this._render();
+    }
+  }
+
+  _update(patch) {
+    const config = { ...this._config, ...patch };
+    for (const [key, value] of Object.entries(patch)) if (value === undefined) delete config[key];
+    this._config = config;
+    this.dispatchEvent(new CustomEvent("config-changed", { detail: { config }, bubbles: true, composed: true }));
+  }
+
+  _render() {
+    if (!this._hass) return;
+    const c = this._config;
+    const forecasts = [...(this._forecasts || new Map()).keys()];
+    const titles = this._titles || new Map();
+    const mapping = c.forecast_strings || {};
+    const option = (value, label, selected) => `<option value="${esc(value)}" ${selected ? "selected" : ""}>${esc(label)}</option>`;
+    const stringRows = (this._strings || []).map((name) => {
+      const current = mapping[name] || "";
+      const options = [option("", "No forecast", !current), ...forecasts.map((id) =>
+        option(id, titles.get(id) || id, current === id || (titles.get(id) || "").toLowerCase() === String(current).toLowerCase()))];
+      return `<label class="row"><span>String ${esc(name)}</span><select data-string="${esc(name)}">${options.join("")}</select></label>`;
+    });
+    const forecastSection = forecasts.length
+      ? `<label class="check"><input type="checkbox" data-key="forecast" ${c.forecast !== false ? "checked" : ""}> Show predicted generation</label>
+         <p class="hint">Match each string to the Forecast.Solar entry for the roof face it's on. Leave them all on
+         "No forecast" to add up every entry as a site total.</p>
+         ${stringRows.join("")}`
+      : `<p class="hint">Predicted generation uses Home Assistant's Forecast.Solar integration, which needs an internet
+         connection. Add one entry per roof face, then come back here to match them to strings.
+         <a href="${SETUP_FORECAST_URL}" target="_blank" rel="noreferrer">Set up Forecast.Solar</a></p>`;
+    this.shadowRoot.innerHTML = `<style>
+        :host { display: block; }
+        .row, .field { display: grid; grid-template-columns: 1fr 1.4fr; align-items: center; gap: 12px; margin: 8px 0; }
+        .check { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
+        h3 { margin: 18px 0 4px; font-size: 1rem; font-weight: 500; }
+        input[type=text], input[type=number], select { font: inherit; padding: 8px; border-radius: 6px; min-width: 0;
+          border: 1px solid var(--divider-color, #ccc); background: var(--card-background-color, #fff); color: var(--primary-text-color); }
+        .hint { margin: 4px 0 8px; font-size: 0.85rem; color: var(--secondary-text-color); }
+        .hint a { color: var(--primary-color); }
+      </style>
+      <label class="field"><span>Title</span><input type="text" data-key="title" value="${esc(c.title ?? "Solar optimizers")}"></label>
+      <label class="field"><span>Style</span><select data-key="style">
+        ${option("default", "Follow my theme", (c.style || "default") === "default")}${option("lcars", "LCARS", c.style === "lcars")}
+      </select></label>
+      <label class="field"><span>Optimizers in "lowest" list</span><input type="number" min="0" max="20" data-key="show_weakest" value="${esc(c.show_weakest ?? 5)}"></label>
+      <label class="check"><input type="checkbox" data-key="show_history" ${c.show_history !== false ? "checked" : ""}> Show the output curve</label>
+      <h3>Predicted generation</h3>
+      ${forecastSection}`;
+    this.shadowRoot.querySelectorAll("[data-key]").forEach((el) => {
+      el.addEventListener("change", () => {
+        const key = el.dataset.key;
+        let value = el.type === "checkbox" ? el.checked : el.value;
+        if (key === "show_weakest") value = Number(value);
+        // Keep the YAML short: leave defaults out.
+        const defaults = { show_history: true, forecast: true, style: "default", show_weakest: 5 };
+        this._update({ [key]: defaults[key] === value ? undefined : value });
+      });
+    });
+    this.shadowRoot.querySelectorAll("[data-string]").forEach((el) => {
+      el.addEventListener("change", () => {
+        const next = { ...(this._config.forecast_strings || {}) };
+        if (el.value) next[el.dataset.string] = el.value;
+        else delete next[el.dataset.string];
+        this._update({ forecast_strings: Object.keys(next).length ? next : undefined });
+      });
+    });
+  }
+}
+
+customElements.define("solaredge-optimizers-card-editor", SolarEdgeOptimizersCardEditor);
 customElements.define("solaredge-optimizers-card", SolarEdgeOptimizersCard);
 
 window.customCards = window.customCards || [];
