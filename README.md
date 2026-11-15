@@ -6,15 +6,23 @@ A Home Assistant dashboard card for the
 [SolarEdge Optimizers](https://github.com/SharperThanThou/SolarEdge-Optimizers)
 integration. It shows every optimizer on your site at once:
 
-- **Panel map.** One tile per optimizer, grouped by string and shaded by
-  how much power it's producing. Optimizers with a health problem get a
-  coloured ring, an icon and the problem written on the tile.
-- **Summary.** Total optimizer output, how many optimizers are producing, how
-  many have a problem, and when the portal last heard from the site.
-- **Today's output.** Total optimizer power since midnight, from Home
-  Assistant's history.
+- **Day navigator.** Step back through earlier days, pick one from the
+  calendar, or jump back to today.
+- **Summary.** Energy produced so far today, output now, how many optimizers
+  are producing, how many have a problem, and when the portal last heard from
+  the site. For an earlier day: its energy, peak output and how many
+  optimizers produced anything.
+- **Strings.** Each string's output now and energy so far, or for an earlier
+  day its energy and peak.
+- **Panel map.** One tile per optimizer, grouped by string. Today each tile
+  shows its output now and its energy so far, shaded by output; for an
+  earlier day it shows the day's total, shaded by energy. Optimizers with a
+  health problem get a coloured ring, an icon and the problem written on the
+  tile.
+- **Output curve.** The site's total optimizer output through the day.
 - **Lowest output vs peers.** The optimizers producing least compared with
-  the median of their string, with 100% marked.
+  the median of their string, with 100% marked. For an earlier day this
+  compares each optimizer's energy instead.
 
 Hover over a tile or bar for its details, and click it to open the
 optimizer's health entity.
@@ -25,7 +33,7 @@ There's also an LCARS-inspired style (`style: lcars`), with an elbow frame,
 sidebar readouts, pill-shaped optimizer buttons and a red-alert pulse on
 faults:
 
-![The LCARS style with made-up data](docs/screenshot-lcars.png)
+![The LCARS style showing yesterday, with made-up data](docs/screenshot-lcars.png)
 
 The card needs no setup. It finds the optimizers through the integration, so
 renamed entities, and optimizers added later, are picked up automatically.
@@ -69,7 +77,7 @@ It's a single-card *panel* view, so the map uses the full width.
 | `title` | `Solar optimizers` | Card title. Set to `""` to hide it. |
 | `style` | `default` | `default` follows your Home Assistant theme. `lcars` uses the LCARS-inspired black panel. |
 | `lcars_font` | `true` | With `style: lcars`, load the Antonio typeface from Google Fonts. Set to `false` to make no external request; a condensed system font is used instead. |
-| `show_history` | `true` | Show today's total output chart. |
+| `show_history` | `true` | Show the output curve for the selected day. |
 | `show_weakest` | `5` | How many optimizers to list under *Lowest output vs peers*. `0` hides the list. |
 | `max_power` | (highest current output) | Fix the power that gets the darkest shade, e.g. your optimizers' rated power. By default the shading is relative to the best optimizer right now. |
 | `site` | (all sites) | Only show the site whose device name contains this text. |
@@ -79,10 +87,32 @@ It's a single-card *panel* view, so the map uses the full width.
 The card uses the entities the integration creates for each optimizer:
 Health, Output vs peers, Power, Module voltage and Last measurement. The map
 shows the integration's confirmed health status, so a tile only turns red
-after the integration's *consecutive bad samples* check agrees. The chart adds
-up the optimizers' power history, so it needs the Recorder (on by default) and
-only covers what Home Assistant has recorded since the integration was
-installed.
+after the integration's *consecutive bad samples* check agrees. Health is
+only known for the present, so earlier days show energy without problem
+markers.
+
+### Energy
+
+The integration reports power, not energy, so the card works energy out from
+the power statistics Home Assistant's Recorder keeps for every power sensor.
+These are five-minute averages, which it adds up over the day. That has a few
+consequences:
+
+- **It's an estimate.** The portal only updates each optimizer every few
+  minutes, so energy is accurate to a few percent, not to the watt-hour. For
+  billing-grade numbers use your inverter's or meter's energy sensor.
+- **History starts when you installed the integration.** Earlier days show
+  no data.
+- **Older days are hourly.** Five-minute statistics are kept as long as the
+  Recorder keeps history (10 days by default). After that the card uses the
+  hourly statistics, which are kept indefinitely: the totals stay the same but
+  the curve is coarser.
+- **Today trails slightly.** Statistics are compiled every five minutes, so
+  the card adds the current reading for the last few minutes.
+- **Days follow your browser's time zone.**
+
+The Recorder needs to be running (it is by default) and must not exclude the
+optimizers' power sensors.
 
 The map's shading uses a single blue scale. Problems use orange (low output)
 and red (no output, not reporting, stuck in safe mode), and always come with
@@ -100,7 +130,7 @@ The card is a single JavaScript file with no build step and no dependencies.
 python3 -m http.server
 # then open http://localhost:8000/demo/
 # ?dark for the dark theme, ?night for an idle site, ?w=358 for phone width,
-# ?lcars for the LCARS style (combine with &)
+# ?lcars for the LCARS style, ?day=-1 for yesterday (combine with &)
 ```
 
 ## License

@@ -3,16 +3,17 @@
  *
  * Finds every optimizer from the SolarEdge Optimizers integration on its own
  * and shows them as a panel map grouped by string, coloured by power, with
- * health problems marked. Also draws today's total optimizer output and the
- * optimizers producing least compared with their peers.
+ * health problems marked. A day navigator shows any recorded day: energy per
+ * optimizer, per string and for the site, worked out from Home Assistant's
+ * power statistics, plus the day's output curve and the optimizers that
+ * produced least compared with their peers.
  *
  * https://github.com/SharperThanThou/SolarEdge-Optimizers-Card
  */
 
 const VERSION = "0.1.0";
 const DOMAIN = "solaredge_optimizers";
-const HISTORY_REFRESH_MS = 10 * 60 * 1000;
-const BUCKET_MS = 5 * 60 * 1000;
+const STATS_REFRESH_MS = 5 * 60 * 1000;
 
 // Sequential blue ramp (magnitude). Light mode runs light -> dark, dark mode
 // runs dark -> light so low output always recedes towards the card surface.
@@ -101,14 +102,48 @@ function niceMax(value) {
   return 10 * exp;
 }
 
+function formatEnergy(wh) {
+  if (wh === null || wh === undefined) return "–";
+  const kwh = wh / 1000;
+  const digits = kwh >= 100 ? 0 : kwh >= 10 ? 1 : 2;
+  return `${kwh.toFixed(digits)} kWh`;
+}
+
+// "25.0 kWh" -> "25.0<small> kWh</small>", for big figures.
+const smallUnit = (text) => String(text).replace(/^([^\s]+)\s+(\S+)$/, "$1<small> $2</small>");
+
+const toMs = (value) => (typeof value === "number" ? (value < 1e12 ? value * 1000 : value) : Date.parse(value));
+
+const isoDay = (date) =>
+  `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+
+const startOfDay = (date) => {
+  const day = new Date(date);
+  day.setHours(0, 0, 0, 0);
+  return day;
+};
+
+const addDays = (date, days) => {
+  const day = new Date(date);
+  day.setDate(day.getDate() + days);
+  return startOfDay(day);
+};
+
+function median(values) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
 class SolarEdgeOptimizersCard extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: "open" });
     this._optimizers = [];
     this._sites = [];
-    this._history = null;
-    this._historyFetched = 0;
+    this._days = new Map();
+    this._day = null; // null means today
     this._width = 0;
   }
 
@@ -140,7 +175,7 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       this._signature = signature;
       this._schedule();
     }
-    this._maybeFetchHistory();
+    this._ensureDayData();
   }
 
   getCardSize() {
@@ -160,7 +195,10 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       }
     });
     this._resize.observe(this);
-    this._clock = setInterval(() => this._schedule(), 60 * 1000);
+    this._clock = setInterval(() => {
+      this._ensureDayData();
+      this._schedule();
+    }, 60 * 1000);
   }
 
   disconnectedCallback() {
@@ -222,8 +260,7 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     this._entityIds = this._optimizers.flatMap((o) => [o.health, o.power, o.ratio, o.last]).filter(Boolean);
     this._entityIds.push(...this._sites.flatMap((s) => [s.problem, s.latest]).filter(Boolean));
     this._signature = null;
-    this._history = null;
-    this._historyFetched = 0;
+    this._days = new Map();
   }
 
   _deviceName(deviceId) {
@@ -246,59 +283,100 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     return (this._entityIds || []).map((id) => states[id]?.last_updated ?? "").join("|") + `|${this._hass.themes?.darkMode}`;
   }
 
-  // ----- history ---------------------------------------------------------
+  // ----- days and statistics ---------------------------------------------
 
-  async _maybeFetchHistory() {
-    if (!this._config?.show_history || this._fetching || !this._optimizers.length) return;
-    if (Date.now() - this._historyFetched < HISTORY_REFRESH_MS) return;
-    const ids = this._optimizers.map((o) => o.power).filter(Boolean);
-    if (!ids.length) return;
-    this._fetching = true;
-    this._historyFetched = Date.now();
-    try {
-      const end = new Date();
-      const start = new Date(end);
-      start.setHours(0, 0, 0, 0);
-      const result = await this._hass.callWS({
-        type: "history/history_during_period",
-        start_time: start.toISOString(),
-        end_time: end.toISOString(),
-        entity_ids: ids,
-        minimal_response: true,
-        no_attributes: true,
-        significant_changes_only: false,
-      });
-      this._history = this._sumHistory(result, ids, start.getTime(), end.getTime());
-      this._schedule();
-    } catch (err) {
-      console.warn("solaredge-optimizers-card: history unavailable", err);
-    } finally {
-      this._fetching = false;
-    }
+  /** Midnight at the start of the selected day. */
+  _selectedDay() {
+    const today = startOfDay(new Date());
+    if (!this._day || this._day >= today) return today;
+    return this._day;
   }
 
-  _sumHistory(result, ids, start, end) {
-    const series = ids.map((id) =>
-      (result[id] || [])
-        .map((p) => ({ t: (p.lu ?? p.lc ?? 0) * 1000, v: parseFloat(p.s) }))
-        .sort((a, b) => a.t - b.t),
-    );
-    const cursors = series.map(() => 0);
-    const values = series.map(() => 0);
-    const points = [];
-    for (let t = start; t <= end; t += BUCKET_MS) {
-      let total = 0;
-      series.forEach((s, i) => {
-        while (cursors[i] < s.length && s[cursors[i]].t <= t) {
-          const v = s[cursors[i]].v;
-          values[i] = Number.isFinite(v) ? v : 0;
-          cursors[i] += 1;
-        }
-        total += values[i];
-      });
-      points.push({ t, v: total });
+  _isToday() {
+    return this._selectedDay().getTime() === startOfDay(new Date()).getTime();
+  }
+
+  _setDay(day) {
+    const today = startOfDay(new Date());
+    this._day = day && day < today ? startOfDay(day) : null;
+    this._hideTip();
+    this._ensureDayData();
+    this._schedule();
+  }
+
+  _ensureDayData() {
+    if (!this._hass || !this._optimizers.length) return;
+    const day = this._selectedDay();
+    const key = isoDay(day);
+    const cached = this._days.get(key);
+    const today = this._isToday();
+    if (cached?.loading) return;
+    if (cached && (!today || Date.now() - cached.fetchedAt < STATS_REFRESH_MS)) return;
+    this._loadDay(key, day, today, cached);
+  }
+
+  async _loadDay(key, day, today, previous) {
+    const ids = this._optimizers.map((o) => o.power).filter(Boolean);
+    if (!ids.length) return;
+    this._days.set(key, { ...(previous || {}), loading: true });
+    const start = day;
+    const end = today ? new Date() : addDays(day, 1);
+    let data;
+    try {
+      let period = "5minute";
+      let result = await this._fetchStats(ids, start, end, period);
+      if (!Object.values(result).some((rows) => rows?.length)) {
+        // Five-minute statistics are purged with the recorder's history;
+        // hourly ones are kept long term.
+        period = "hour";
+        result = await this._fetchStats(ids, start, end, period);
+      }
+      data = this._summariseStats(result, ids, period);
+    } catch (err) {
+      console.warn("solaredge-optimizers-card: statistics unavailable", err);
+      data = { error: true, perEntity: new Map(), curve: [], period: null, lastEnd: start.getTime() };
     }
-    return points;
+    this._days.set(key, { ...data, day: start.getTime(), fetchedAt: Date.now(), loading: false });
+    this._schedule();
+  }
+
+  _fetchStats(ids, start, end, period) {
+    return this._hass.callWS({
+      type: "recorder/statistics_during_period",
+      start_time: start.toISOString(),
+      end_time: end.toISOString(),
+      statistic_ids: ids,
+      period,
+      types: ["mean", "max"],
+      units: { power: "W" },
+    });
+  }
+
+  _summariseStats(result, ids, period) {
+    const perEntity = new Map();
+    const totals = new Map();
+    let lastEnd = 0;
+    for (const id of ids) {
+      const series = new Map();
+      let energy = 0;
+      let peak = 0;
+      let rows = 0;
+      for (const row of result[id] || []) {
+        const start = toMs(row.start);
+        const end = row.end !== undefined ? toMs(row.end) : start + (period === "hour" ? 3600000 : 300000);
+        const mean = Number(row.mean);
+        if (!Number.isFinite(start) || !Number.isFinite(mean)) continue;
+        energy += (Math.max(mean, 0) * (end - start)) / 3600000;
+        peak = Math.max(peak, Number(row.max) || mean);
+        series.set(start, mean);
+        totals.set(start, (totals.get(start) || 0) + mean);
+        lastEnd = Math.max(lastEnd, end);
+        rows += 1;
+      }
+      perEntity.set(id, rows ? { energy, peak, series } : null);
+    }
+    const curve = [...totals.entries()].sort((a, b) => a[0] - b[0]).map(([t, v]) => ({ t, v }));
+    return { perEntity, curve, period, lastEnd };
   }
 
   // ----- rendering -------------------------------------------------------
@@ -314,34 +392,100 @@ class SolarEdgeOptimizersCard extends HTMLElement {
 
   _model() {
     const states = this._hass.states;
+    const today = this._isToday();
+    const day = this._selectedDay();
+    const stats = this._days.get(isoDay(day));
+    const ready = Boolean(stats && stats.perEntity);
+    const now = Date.now();
+
     const items = this._optimizers.map((o) => {
       const health = states[o.health];
-      const status = health?.state in STATUS ? health.state : "unknown";
+      const status = today && health?.state in STATUS ? health.state : "unknown";
       const last = states[o.last]?.state;
+      const watts = num(states[o.power]);
+      const stat = ready ? stats.perEntity.get(o.power) : undefined;
+      let energy = ready ? (stat ? stat.energy : 0) : null;
+      if (today && ready && watts) {
+        // Statistics trail by up to ten minutes; fill the gap with the
+        // current reading, but never more than 20 minutes of it.
+        const gap = Math.min(Math.max(now - (stats.lastEnd || now), 0), 20 * 60000);
+        energy += (watts * gap) / 3600000;
+      }
       return {
         ...o,
         status,
         statusLabel: health && this._hass.formatEntityState ? this._hass.formatEntityState(health) : STATUS[status].label,
         string: health?.attributes.string || "Unassigned",
-        watts: num(states[o.power]),
-        ratio: num(states[o.ratio]),
+        watts,
+        energy,
+        peak: stat?.peak ?? null,
+        series: stat?.series,
+        ratio: today ? num(states[o.ratio]) : null,
         volts: num(states[o.voltage]),
         lastAt: last ? new Date(last) : null,
       };
     });
-    const strings = new Map();
+
+    const groups = new Map();
     for (const item of items) {
-      if (!strings.has(item.string)) strings.set(item.string, []);
-      strings.get(item.string).push(item);
+      if (!groups.has(item.string)) groups.set(item.string, []);
+      groups.get(item.string).push(item);
     }
-    const sortedStrings = [...strings.entries()].sort(([a], [b]) => naturalCompare(a, b));
-    const max = Math.max(this._config.max_power || 0, ...items.map((i) => i.watts || 0));
+    const strings = [...groups.entries()]
+      .sort(([a], [b]) => naturalCompare(a, b))
+      .map(([name, list]) => {
+        const totals = new Map();
+        for (const item of list) {
+          for (const [t, v] of item.series || []) totals.set(t, (totals.get(t) || 0) + v);
+        }
+        return {
+          name,
+          list,
+          watts: list.reduce((sum, i) => sum + (i.watts || 0), 0),
+          energy: ready ? list.reduce((sum, i) => sum + (i.energy || 0), 0) : null,
+          peak: totals.size ? Math.max(...totals.values()) : null,
+        };
+      });
+
+    // Energy as a share of the median of the rest of the string, for past days.
+    for (const group of strings) {
+      for (const item of group.list) {
+        const others = group.list.filter((o) => o !== item && o.energy !== null).map((o) => o.energy);
+        const pool = others.length >= 2 ? others : items.filter((o) => o !== item && o.energy !== null).map((o) => o.energy);
+        const med = median(pool);
+        item.energyRatio = item.energy !== null && med ? (item.energy / med) * 100 : null;
+      }
+    }
+
+    const curve = ready ? [...stats.curve] : null;
+    if (curve && today) curve.push({ t: now, v: items.reduce((sum, i) => sum + (i.watts || 0), 0) });
+    const scaleMax = today
+      ? Math.max(this._config.max_power || 0, ...items.map((i) => i.watts || 0))
+      : Math.max(...items.map((i) => i.energy || 0));
     const latest = items.reduce((acc, i) => (i.lastAt && (!acc || i.lastAt > acc) ? i.lastAt : acc), null);
-    return { items, strings: sortedStrings, max, latest };
+    return {
+      today,
+      day,
+      ready,
+      error: Boolean(stats?.error),
+      period: stats?.period,
+      items,
+      strings,
+      scaleMax,
+      latest,
+      curve,
+      energy: ready ? items.reduce((sum, i) => sum + (i.energy || 0), 0) : null,
+      peak: curve && curve.length ? Math.max(...curve.map((p) => p.v)) : null,
+    };
   }
 
   _render() {
     if (!this._hass || !this._config) return;
+    if (this.shadowRoot.activeElement?.classList?.contains("nav-date")) {
+      // Re-rendering would close the date picker; try again once it's done.
+      this._deferred = true;
+      return;
+    }
     const model = this._model();
     const dark = Boolean(this._hass.themes?.darkMode);
     const lcars = this._config.style === "lcars";
@@ -359,9 +503,22 @@ class SolarEdgeOptimizersCard extends HTMLElement {
       this._shell.addEventListener("pointerleave", () => this._hideTip());
       this._shell.addEventListener("click", (ev) => this._click(ev));
       this._shell.addEventListener("keydown", (ev) => {
-        if (ev.key === "Enter" || ev.key === " ") this._click(ev);
+        if ((ev.key === "Enter" || ev.key === " ") && !ev.target.closest?.("button, input")) this._click(ev);
+      });
+      this._shell.addEventListener("change", (ev) => {
+        if (!ev.target.classList?.contains("nav-date") || !ev.target.value) return;
+        const [y, m, d] = ev.target.value.split("-").map(Number);
+        ev.target.blur();
+        this._setDay(new Date(y, m - 1, d));
+      });
+      this._shell.addEventListener("focusout", () => {
+        if (this._deferred) {
+          this._deferred = false;
+          this._schedule();
+        }
       });
     }
+    this._model_ = model;
     this._items = model.items;
     this._card.classList.toggle("lcars", lcars);
     this._shell.classList.toggle("narrow", Boolean(this._width) && this._width < 520);
@@ -379,12 +536,30 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     }
     const stroke = dark ? "#3987e5" : "#2a78d6";
     this._shell.innerHTML = [
-      this._config.title ? `<h1 class="title">${esc(this._config.title)}</h1>` : "",
+      `<div class="head">${this._config.title ? `<h1 class="title">${esc(this._config.title)}</h1>` : ""}${this._renderNav(model)}</div>`,
       this._renderStats(model),
-      this._config.show_history ? this._renderHistory(stroke, this._width - 32) : "",
+      this._config.show_history ? this._renderHistory(model, stroke, this._width - 32) : "",
       this._renderMap(model, ramp),
       this._renderWeakest(model, ramp),
     ].join("");
+  }
+
+  _dayLabel(model, long = false) {
+    if (model.today) return "Today";
+    if (model.day.getTime() === addDays(startOfDay(new Date()), -1).getTime()) return "Yesterday";
+    return model.day.toLocaleDateString(undefined, long
+      ? { weekday: "long", day: "numeric", month: "long", year: "numeric" }
+      : { weekday: "short", day: "numeric", month: "short" });
+  }
+
+  _renderNav(model) {
+    const today = isoDay(startOfDay(new Date()));
+    return `<div class="nav" role="group" aria-label="Day">
+      <button class="nav-btn" data-nav="prev" aria-label="Previous day">‹</button>
+      <input class="nav-date" type="date" value="${isoDay(model.day)}" max="${today}" aria-label="Day to show">
+      <button class="nav-btn" data-nav="next" aria-label="Next day" ${model.today ? "disabled" : ""}>›</button>
+      <button class="nav-btn nav-today" data-nav="today" ${model.today ? "disabled" : ""}>Today</button>
+    </div>`;
   }
 
   _summary({ items, latest }) {
@@ -392,10 +567,16 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     return {
       total: items.reduce((sum, i) => sum + (i.watts || 0), 0),
       producing: items.filter((i) => (i.watts || 0) > 0).length,
+      produced: items.filter((i) => (i.energy || 0) > 0).length,
       problems,
       tone: problems.length ? (problems.some((p) => STATUS[p.status].tone === "critical") ? "critical" : "serious") : "good",
       latest,
     };
+  }
+
+  _energyText(model) {
+    if (model.error) return "–";
+    return model.ready ? formatEnergy(model.energy) : "…";
   }
 
   _renderLcars(model, ramp) {
@@ -403,122 +584,177 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     const side = this._width && this._width < 520 ? 70 : 124;
     const alert = sum.problems.length ? `background:${TONE[sum.tone]}` : `background:${LCARS.blue}`;
     const block = (label, value, style, cls = "") =>
-      `<div class="lc-block ${cls}" style="${style}"><span class="lc-label">${label}</span><span class="lc-value">${value}</span></div>`;
+      `<div class="lc-block ${cls}" style="${style}"><span class="lc-label">${label}</span><span class="lc-value">${smallUnit(value)}</span></div>`;
+    const blocks = model.today
+      ? [
+          block("Energy today", this._energyText(model), `background:${LCARS.orange}`, "lead"),
+          block("Output now", formatPower(sum.total), `background:${LCARS.lavender}`),
+          block("Producing", `${sum.producing}/${model.items.length}`, `background:${LCARS.peach}`),
+          block("Problems", sum.problems.length, alert, sum.tone === "critical" ? "alert" : ""),
+          block("Last report", relativeTime(sum.latest), `background:${LCARS.tan}`, "small"),
+        ]
+      : [
+          block(`Energy · ${esc(this._dayLabel(model))}`, this._energyText(model), `background:${LCARS.orange}`, "lead"),
+          block("Peak output", model.peak === null ? "–" : formatPower(model.peak), `background:${LCARS.lavender}`),
+          block("Produced", model.ready ? `${sum.produced}/${model.items.length}` : "…", `background:${LCARS.peach}`),
+        ];
     return `<div class="lc" style="--side:${side}px">
       <div class="lc-corner"></div>
       <div class="lc-top"><span class="lc-bar"></span>${this._config.title ? `<h1 class="lc-title">${esc(this._config.title)}</h1>` : ""}<span class="lc-cap"></span></div>
       <div class="lc-side">
-        ${block("Output", formatPower(sum.total), `background:${LCARS.lavender}`)}
-        ${block("Producing", `${sum.producing}/${model.items.length}`, `background:${LCARS.peach}`)}
-        ${block("Problems", sum.problems.length, alert, sum.tone === "critical" ? "alert" : "")}
-        ${block("Last report", relativeTime(sum.latest), `background:${LCARS.tan}`, "small")}
+        ${blocks.join("")}
         <div class="lc-block lc-fill" style="background:${LCARS.violet}"></div>
       </div>
       <div class="lc-main">
-        ${this._config.show_history ? this._renderHistory(LCARS.orange, this._width - side - 46) : ""}
+        ${this._renderNav(model)}
+        ${this._config.show_history ? this._renderHistory(model, LCARS.orange, this._width - side - 46) : ""}
         ${this._renderMap(model, ramp)}
         ${this._renderWeakest(model, ramp)}
       </div>
       <div class="lc-corner-b"></div>
       <div class="lc-bottom"><span class="lc-bar"></span>
-        <span class="lc-code">${model.items.length} optimizers · ${model.strings.length} ${model.strings.length === 1 ? "string" : "strings"}</span>
+        <span class="lc-code">${esc(this._dayLabel(model, true))} · ${model.items.length} optimizers · ${model.strings.length} ${model.strings.length === 1 ? "string" : "strings"}</span>
         <span class="lc-cap"></span></div>
     </div>`;
   }
 
   _renderStats(model) {
-    const { total, producing, problems, tone: problemTone, latest } = this._summary(model);
-    const { items } = model;
-    return `<div class="stats">
-      <div class="stat"><div class="label">Output now</div><div class="value">${formatPower(total)}</div></div>
-      <div class="stat"><div class="label">Producing</div><div class="value">${producing}<span class="of"> / ${items.length}</span></div></div>
-      <div class="stat"><div class="label">Problems</div><div class="value">
-        <ha-icon class="tone-${problemTone}" icon="${problems.length ? "mdi:alert-circle" : "mdi:check-circle"}"></ha-icon>${problems.length}</div></div>
-      <div class="stat"><div class="label">Last report</div><div class="value small">${relativeTime(latest)}</div></div>
-    </div>`;
+    const { total, producing, produced, problems, tone: problemTone, latest } = this._summary(model);
+    const n = model.items.length;
+    const stat = (label, value, cls = "") => `<div class="stat ${cls}"><div class="label">${label}</div><div class="value">${smallUnit(value)}</div></div>`;
+    const stats = model.today
+      ? [
+          stat("Energy today", this._energyText(model), "lead"),
+          stat("Output now", formatPower(total)),
+          stat("Producing", `${producing}<span class="of"> / ${n}</span>`),
+          stat("Problems", `<ha-icon class="tone-${problemTone}" icon="${problems.length ? "mdi:alert-circle" : "mdi:check-circle"}"></ha-icon>${problems.length}`),
+          `<div class="stat"><div class="label">Last report</div><div class="value small">${relativeTime(latest)}</div></div>`,
+        ]
+      : [
+          stat(`Energy · ${esc(this._dayLabel(model))}`, this._energyText(model), "lead"),
+          stat("Peak output", model.peak === null ? "–" : formatPower(model.peak)),
+          stat("Produced", model.ready ? `${produced}<span class="of"> / ${n}</span>` : "…"),
+        ];
+    return `<div class="stats">${stats.join("")}</div>`;
   }
 
-  _renderMap({ strings, max }, ramp) {
-    const sections = strings.map(([name, list]) => {
-      const total = list.reduce((sum, i) => sum + (i.watts || 0), 0);
-      const tiles = list.map((item) => {
+  _stringTitle(name, count) {
+    if (name === "Unassigned") return count > 1 ? "Not in a string" : "Optimizers";
+    return /^string/i.test(name) ? name : `String ${name}`;
+  }
+
+  _renderMap(model, ramp) {
+    const { strings, scaleMax, today } = model;
+    const sections = strings.map((group) => {
+      const tiles = group.list.map((item) => {
         const index = this._items.indexOf(item);
         const status = STATUS[item.status];
-        const lit = item.watts && item.watts > 0;
-        let fill = lit ? rampColor(ramp, item.watts / (max || 1)) : null;
+        const value = today ? item.watts : item.energy;
+        const lit = value !== null && value > 0;
+        let fill = lit ? rampColor(ramp, value / (scaleMax || 1)) : null;
         if (this._lcars && status.problem) fill = TONE[status.tone];
         const ink = fill ? (isLight(fill) ? "#0b0b0b" : "#ffffff") : null;
         const style = fill ? `background:${fill};color:${ink}` : "";
         const badge = status.problem
           ? `<span class="badge tone-bg-${status.tone}"><ha-icon icon="${status.icon}"></ha-icon></span>`
           : "";
-        return `<div class="tile ${lit ? "" : "dim"} ${status.problem ? `problem ring-${status.tone}` : ""}"
-            style="${style}" data-index="${index}" tabindex="0" role="button"
-            aria-label="${esc(`${item.fullName}: ${formatPower(item.watts)}, ${item.statusLabel}`)}">
+        const energy = item.energy === null ? "–" : (item.energy / 1000).toFixed(2);
+        const main = today
+          ? `<span class="watts">${item.watts === null ? "–" : Math.round(item.watts)}<small> W</small></span>
+             <span class="kwh">${energy}<small> kWh</small></span>`
+          : `<span class="watts">${energy}<small> kWh</small></span>`;
+        const label = today
+          ? `${item.fullName}: ${formatPower(item.watts)} now, ${formatEnergy(item.energy)} today, ${item.statusLabel}`
+          : `${item.fullName}: ${formatEnergy(item.energy)}`;
+        return `<div class="tile ${lit ? "" : "dim"} ${status.problem ? `problem ring-${status.tone}` : ""} ${today ? "" : "past"}"
+            style="${style}" data-index="${index}" tabindex="0" role="button" aria-label="${esc(label)}">
           ${badge}
           <span class="name">${esc(item.name)}</span>
-          <span class="watts">${item.watts === null ? "–" : Math.round(item.watts)}<small> W</small></span>
           ${status.problem ? `<span class="state">${esc(item.statusLabel)}</span>` : ""}
+          ${main}
         </div>`;
       });
+      const figures = today
+        ? `<span class="fig"><span class="fig-label">now</span>${formatPower(group.watts)}</span>
+           <span class="fig"><span class="fig-label">today</span>${group.energy === null ? "…" : formatEnergy(group.energy)}</span>`
+        : `<span class="fig"><span class="fig-label">energy</span>${group.energy === null ? "…" : formatEnergy(group.energy)}</span>
+           <span class="fig"><span class="fig-label">peak</span>${group.peak === null ? "–" : formatPower(group.peak)}</span>`;
       return `<section class="string">
-        <div class="string-head"><span>${esc(name === "Unassigned" ? (strings.length > 1 ? "Not in a string" : "Optimizers") : /^string/i.test(name) ? name : `String ${name}`)}</span>
-          <span class="rule"></span><span class="muted">${list.length} · ${formatPower(total)}</span></div>
+        <div class="string-head"><span class="string-name">${esc(this._stringTitle(group.name, strings.length))}
+          <span class="muted count">${group.list.length}</span></span>
+          <span class="rule"></span><span class="figs">${figures}</span></div>
         <div class="grid">${tiles.join("")}</div>
       </section>`;
     });
     const gradient = ramp.map((c, i) => `${c} ${Math.round((i / (ramp.length - 1)) * 100)}%`).join(",");
-    return `<div class="map">${sections.join("")}</div>
-      <div class="legend">
-        ${max > 0 ? `<span class="scale"><span class="muted">0 W</span><span class="bar" style="background:linear-gradient(90deg,${gradient})"></span><span class="muted">${formatPower(max)}</span></span>` : ""}
-        <span class="key"><span class="dot tone-bg-serious"></span>Low output</span>
-        <span class="key"><span class="dot tone-bg-critical"></span>No output / not reporting / safe mode</span>
-      </div>`;
+    const scale = scaleMax > 0
+      ? `<span class="scale"><span class="muted">0 ${today ? "W" : "kWh"}</span><span class="bar" style="background:linear-gradient(90deg,${gradient})"></span><span class="muted">${today ? formatPower(scaleMax) : formatEnergy(scaleMax)}</span></span>`
+      : "";
+    const keys = today
+      ? `<span class="key"><span class="dot tone-bg-serious"></span>Low output</span>
+         <span class="key"><span class="dot tone-bg-critical"></span>No output / not reporting / safe mode</span>`
+      : `<span class="key muted">Shaded by each optimizer's energy for the day.</span>`;
+    return `<div class="map">${sections.join("")}</div><div class="legend">${scale}${keys}</div>`;
   }
 
-  _renderWeakest({ items }, ramp) {
+  _renderWeakest(model, ramp) {
     const count = Number(this._config.show_weakest) || 0;
     if (!count) return "";
-    const compared = items.filter((i) => i.ratio !== null).sort((a, b) => a.ratio - b.ratio).slice(0, count);
-    const head = `<h2 class="sub">Lowest output vs peers</h2>`;
+    const { items, today } = model;
+    const key = today ? "ratio" : "energyRatio";
+    const compared = items.filter((i) => i[key] !== null).sort((a, b) => a[key] - b[key]).slice(0, count);
+    const head = `<h2 class="sub">${today ? "Lowest output vs peers" : "Lowest energy vs peers"}</h2>`;
     if (!compared.length) {
-      return `${head}<p class="muted note">Comparisons start once the panels produce enough power to judge.</p>`;
+      const why = today
+        ? "Comparisons start once the panels produce enough power to judge."
+        : model.ready ? "No recorded energy to compare for this day." : "Loading…";
+      return `${head}<p class="muted note">${why}</p>`;
     }
-    const scaleMax = Math.max(150, ...compared.map((i) => i.ratio));
+    const scaleMax = Math.max(150, ...compared.map((i) => i[key]));
     const rows = compared.map((item) => {
       const index = this._items.indexOf(item);
       const status = STATUS[item.status];
-      const width = Math.max((item.ratio / scaleMax) * 100, 0.5);
+      const width = Math.max((item[key] / scaleMax) * 100, 0.5);
+      const extra = today
+        ? status.problem ? `<ha-icon class="tone-${status.tone}" icon="${status.icon}"></ha-icon><span class="row-label">${esc(item.statusLabel)}</span>` : ""
+        : `<span class="row-label">${formatEnergy(item.energy)}</span>`;
       return `<div class="row" data-index="${index}" tabindex="0" role="button">
         <span class="row-name">${esc(item.name)}</span>
         <span class="track"><span class="fill" style="width:${width}%;background:${ramp[4]}"></span>
           <span class="ref" style="left:${(100 / scaleMax) * 100}%"></span></span>
-        <span class="row-val">${Math.round(item.ratio)}%</span>
-        <span class="row-status">${status.problem ? `<ha-icon class="tone-${status.tone}" icon="${status.icon}"></ha-icon><span class="row-label">${esc(item.statusLabel)}</span>` : ""}</span>
+        <span class="row-val">${Math.round(item[key])}%</span>
+        <span class="row-status">${extra}</span>
       </div>`;
     });
-    return `${head}<div class="rows">${rows.join("")}</div>
-      <p class="muted note">The tick marks 100%, the median of each optimizer's string.</p>`;
+    const note = today
+      ? "The tick marks 100%, the median of each optimizer's string."
+      : "The tick marks 100%, the median energy of each optimizer's string that day.";
+    return `${head}<div class="rows">${rows.join("")}</div><p class="muted note">${note}</p>`;
   }
 
-  _renderHistory(stroke, available) {
-    const head = `<h2 class="sub">Optimizer output today</h2>`;
-    const points = this._history;
-    if (!points) return `${head}<div class="chart placeholder muted">Loading history…</div>`;
+  _renderHistory(model, stroke, available) {
+    const head = `<h2 class="sub">Output · ${esc(this._dayLabel(model))}</h2>`;
+    const points = model.curve;
+    if (!points) return `${head}<div class="chart placeholder muted">${model.error ? "Statistics unavailable." : "Loading…"}</div>`;
+    if (!points.length || (points.length === 1 && !points[0].v)) {
+      return `${head}<div class="chart placeholder muted">No recorded output for this day.</div>`;
+    }
     const width = Math.max(available || 0, 220);
     const height = 140;
     const pad = { l: 44, r: 8, t: 8, b: 22 };
     const innerW = width - pad.l - pad.r;
     const innerH = height - pad.t - pad.b;
-    const day0 = new Date(points[0].t);
-    const dayStart = day0.getTime();
-    const dayEnd = dayStart + 24 * 3600 * 1000;
+    const dayStart = model.day.getTime();
+    const dayEnd = addDays(model.day, 1).getTime();
     const peak = Math.max(...points.map((p) => p.v));
     const yMax = niceMax(peak * 1.05);
+    const step = model.period === "hour" ? 3600000 : 300000;
+    // Each statistic covers [t, t + step); plot it at the middle.
+    const plotted = points.map((p, i) => ({ t: model.today && i === points.length - 1 ? p.t : p.t + step / 2, v: p.v }));
     const x = (t) => pad.l + ((t - dayStart) / (dayEnd - dayStart)) * innerW;
     const y = (v) => pad.t + innerH - (v / yMax) * innerH;
-    const line = points.map((p, i) => `${i ? "L" : "M"}${x(p.t).toFixed(1)},${y(p.v).toFixed(1)}`).join("");
-    const area = `${line}L${x(points.at(-1).t).toFixed(1)},${y(0)}L${x(points[0].t).toFixed(1)},${y(0)}Z`;
+    const line = plotted.map((p, i) => `${i ? "L" : "M"}${x(p.t).toFixed(1)},${y(p.v).toFixed(1)}`).join("");
+    const area = `${line}L${x(plotted.at(-1).t).toFixed(1)},${y(0)}L${x(plotted[0].t).toFixed(1)},${y(0)}Z`;
     const grid = [0, 0.5, 1]
       .map((f) => `<line x1="${pad.l}" x2="${width - pad.r}" y1="${y(yMax * f)}" y2="${y(yMax * f)}" class="${f ? "gridline" : "baseline"}"/>
         <text x="${pad.l - 6}" y="${y(yMax * f) + 4}" text-anchor="end" class="axis">${formatPower(yMax * f)}</text>`)
@@ -526,15 +762,16 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     const ticks = [0, 6, 12, 18, 24]
       .map((h) => `<text x="${x(dayStart + h * 3600 * 1000)}" y="${height - 6}" text-anchor="middle" class="axis">${String(h % 24).padStart(2, "0")}:00</text>`)
       .join("");
-    this._chartGeom = { points, x, y, pad, width, height, dayStart, dayEnd, innerW };
+    this._chartGeom = { points: plotted, x, y, pad, dayStart, dayEnd, innerW, step };
+    const note = model.period === "hour" ? `<p class="muted note">Hourly averages: five-minute detail is no longer kept for this day.</p>` : "";
     return `${head}<div class="chart" data-chart="1">
-      <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="Total optimizer output today, peak ${formatPower(peak)}">
+      <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="Total optimizer output, peak ${formatPower(peak)}">
         ${grid}${ticks}
         <path d="${area}" fill="${stroke}" opacity="0.16"/>
         <path d="${line}" fill="none" stroke="${stroke}" stroke-width="2" stroke-linejoin="round"/>
         <line class="cross" x1="0" x2="0" y1="${pad.t}" y2="${pad.t + innerH}" visibility="hidden"/>
         <circle class="cross-dot" r="4" fill="${stroke}" visibility="hidden"/>
-      </svg></div>`;
+      </svg></div>${note}`;
   }
 
   // ----- interaction -----------------------------------------------------
@@ -553,16 +790,24 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     const item = this._items[Number(el.dataset.index)];
     if (!item) return;
     const status = STATUS[item.status];
-    this._showTip(
-      ev,
-      `<strong>${esc(item.fullName)}</strong>
-      <div class="tip-row"><span>String</span><span>${esc(item.string)}</span></div>
-      <div class="tip-row"><span>Power</span><span>${formatPower(item.watts)}</span></div>
-      <div class="tip-row"><span>vs peers</span><span>${item.ratio === null ? "–" : `${Math.round(item.ratio)}%`}</span></div>
-      <div class="tip-row"><span>Module</span><span>${item.volts === null ? "–" : `${item.volts.toFixed(1)} V`}</span></div>
-      <div class="tip-row"><span>Health</span><span>${status.problem ? `<ha-icon class="tone-${status.tone}" icon="${status.icon}"></ha-icon>` : ""}${esc(item.statusLabel)}</span></div>
-      <div class="tip-row"><span>Reported</span><span>${relativeTime(item.lastAt)}</span></div>`,
-    );
+    const row = (label, value) => `<div class="tip-row"><span>${label}</span><span>${value}</span></div>`;
+    const rows = this._model_.today
+      ? [
+          row("String", esc(item.string)),
+          row("Power", formatPower(item.watts)),
+          row("Energy today", formatEnergy(item.energy)),
+          row("vs peers", item.ratio === null ? "–" : `${Math.round(item.ratio)}%`),
+          row("Module", item.volts === null ? "–" : `${item.volts.toFixed(1)} V`),
+          row("Health", `${status.problem ? `<ha-icon class="tone-${status.tone}" icon="${status.icon}"></ha-icon>` : ""}${esc(item.statusLabel)}`),
+          row("Reported", relativeTime(item.lastAt)),
+        ]
+      : [
+          row("String", esc(item.string)),
+          row("Energy", formatEnergy(item.energy)),
+          row("Peak", item.peak === null ? "–" : formatPower(item.peak)),
+          row("vs peers", item.energyRatio === null ? "–" : `${Math.round(item.energyRatio)}%`),
+        ];
+    this._showTip(ev, `<strong>${esc(item.fullName)}</strong>${rows.join("")}`);
   }
 
   _hoverChart(ev, chart) {
@@ -571,12 +816,12 @@ class SolarEdgeOptimizersCard extends HTMLElement {
     const rect = svg.getBoundingClientRect();
     const px = ev.clientX - rect.left;
     const t = g.dayStart + ((px - g.pad.l) / g.innerW) * (g.dayEnd - g.dayStart);
-    let best = g.points[0];
-    for (const p of g.points) if (Math.abs(p.t - t) < Math.abs(best.t - t)) best = p;
-    if (t > g.points.at(-1).t + BUCKET_MS || px < g.pad.l) {
+    if (px < g.pad.l || t > g.points.at(-1).t + g.step || t < g.points[0].t - g.step) {
       this._hideTip();
       return;
     }
+    let best = g.points[0];
+    for (const p of g.points) if (Math.abs(p.t - t) < Math.abs(best.t - t)) best = p;
     const cx = g.x(best.t);
     const cross = svg.querySelector(".cross");
     const dot = svg.querySelector(".cross-dot");
@@ -611,6 +856,15 @@ class SolarEdgeOptimizersCard extends HTMLElement {
   }
 
   _click(ev) {
+    const nav = ev.target.closest?.("[data-nav]");
+    if (nav) {
+      if (nav.disabled) return;
+      const day = this._selectedDay();
+      if (nav.dataset.nav === "prev") this._setDay(addDays(day, -1));
+      if (nav.dataset.nav === "next") this._setDay(addDays(day, 1));
+      if (nav.dataset.nav === "today") this._setDay(null);
+      return;
+    }
     const el = ev.target.closest?.("[data-index]");
     if (!el) return;
     const item = this._items[Number(el.dataset.index)];
@@ -624,7 +878,17 @@ const STYLES = `
   :host { display: block; }
   ha-card { position: relative; overflow: visible; }
   .body { padding: 16px; }
-  .title { margin: 0 0 12px; font-size: 1.25rem; font-weight: 500; color: var(--primary-text-color); }
+  .head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; margin-bottom: 12px; }
+  .title { margin: 0; font-size: 1.25rem; font-weight: 500; color: var(--primary-text-color); }
+  .nav { display: flex; align-items: center; gap: 4px; }
+  .nav-btn { font: inherit; font-size: 0.9rem; min-width: 32px; height: 32px; padding: 0 10px; border-radius: 16px; cursor: pointer;
+    border: 1px solid var(--divider-color); background: var(--secondary-background-color); color: var(--primary-text-color); }
+  .nav-btn[data-nav="prev"], .nav-btn[data-nav="next"] { font-size: 1.2rem; line-height: 1; padding: 0; }
+  .nav-btn:disabled { opacity: 0.4; cursor: default; }
+  .nav-btn:not(:disabled):hover { border-color: var(--primary-text-color); }
+  .nav-date { font: inherit; font-size: 0.9rem; height: 32px; box-sizing: border-box; padding: 0 8px; border-radius: 16px;
+    border: 1px solid var(--divider-color); background: var(--secondary-background-color); color: var(--primary-text-color);
+    color-scheme: light dark; }
   .sub { margin: 20px 0 8px; font-size: 0.95rem; font-weight: 500; color: var(--primary-text-color); }
   .muted { color: var(--secondary-text-color); }
   .note { font-size: 0.8rem; margin: 6px 0 0; }
@@ -636,6 +900,7 @@ const STYLES = `
   .stat .label { font-size: 0.75rem; color: var(--secondary-text-color); }
   .stat .value { font-size: 1.5rem; font-weight: 500; color: var(--primary-text-color); display: flex; align-items: center; gap: 4px; }
   .stat .value.small { font-size: 1.05rem; min-height: 2.25rem; }
+  .stat.lead { background: color-mix(in srgb, var(--primary-color) 14%, var(--secondary-background-color)); }
   .stat .of { font-size: 0.95rem; color: var(--secondary-text-color); font-weight: 400; }
   .stat ha-icon { --mdc-icon-size: 22px; }
 
@@ -653,6 +918,13 @@ const STYLES = `
   .tile .watts { font-size: 1.05rem; font-weight: 600; font-variant-numeric: tabular-nums; }
   .tile .watts small { font-size: 0.65rem; font-weight: 400; }
   .tile .state { font-size: 0.62rem; line-height: 1.1; }
+  .tile .kwh { font-size: 0.68rem; font-variant-numeric: tabular-nums; opacity: 0.9; margin-top: -4px; white-space: nowrap; }
+  .tile .kwh small { font-size: 0.6rem; }
+  .tile.past .watts { font-size: 0.95rem; }
+  .string-head { align-items: baseline; gap: 8px; }
+  .string-name .count { font-size: 0.75rem; margin-left: 4px; }
+  .figs { display: inline-flex; gap: 12px; font-variant-numeric: tabular-nums; }
+  .fig-label { color: var(--secondary-text-color); margin-right: 4px; font-size: 0.75rem; }
   .badge { position: absolute; top: -6px; right: -6px; width: 20px; height: 20px; border-radius: 50%;
     display: flex; align-items: center; justify-content: center; color: #fff;
     box-shadow: 0 0 0 2px var(--card-background-color, #fff); }
@@ -708,7 +980,16 @@ const STYLES = `
   .narrow .lc-title { font-size: 1.35rem; margin-top: -1px; }
   .narrow .lc-top .lc-cap, .narrow .lc-bottom .lc-cap { width: 24px; }
   .narrow .lc-block { min-height: 54px; padding: 4px 6px; }
-  .narrow .lc-value { font-size: 1.15rem; }
+  .narrow .lc-value, .narrow .lc-block.lead .lc-value { font-size: 1.15rem; }
+  .narrow .figs { gap: 8px; font-size: 0.8rem; }
+  .narrow .string-head .rule { display: none; }
+  .narrow .string-head { flex-wrap: wrap; row-gap: 2px; }
+  .narrow .figs { flex-basis: 100%; }
+  .fig { white-space: nowrap; }
+  .nav { flex-wrap: wrap; }
+  .narrow .nav-date { flex: 1 1 120px; min-width: 0; }
+  .lcars .narrow .nav-btn[data-nav] { width: auto; min-width: 32px; }
+  .lcars .narrow .nav-today { padding: 0 10px; }
   .narrow .lc-block.small .lc-value { font-size: 0.85rem; }
   .narrow .lc-main { padding-left: 12px; }
   .narrow .lc-code { font-size: 0.7rem; }
@@ -746,6 +1027,22 @@ const STYLES = `
   .lc-label { font-size: 0.7rem; line-height: 1.1; text-align: right; }
   .lc-value { font-size: 1.6rem; line-height: 1.05; font-weight: 700; text-align: right; }
   .lc-block.small .lc-value { font-size: 1.05rem; }
+  .lc-block.lead { min-height: 78px; }
+  .lc-block.lead .lc-value { font-size: 1.9rem; }
+  .lc-value small { font-size: 0.6em; font-weight: 400; }
+  .stat .value small { font-size: 0.6em; font-weight: 400; color: var(--secondary-text-color); }
+  .lcars .nav { gap: 6px; margin-bottom: 4px; }
+  .lcars .nav-btn, .lcars .nav-date { font-family: inherit; text-transform: uppercase; letter-spacing: 0.04em; border: none;
+    height: 30px; border-radius: 15px; color: #000; font-weight: 700; }
+  .lcars .nav-btn[data-nav="prev"] { background: var(--lc-lavender); border-radius: 15px 4px 4px 15px; width: 44px; }
+  .lcars .nav-btn[data-nav="next"] { background: var(--lc-lavender); border-radius: 4px 15px 15px 4px; width: 44px; }
+  .lcars .nav-date { background: var(--lc-peach); border-radius: 4px; padding: 0 10px; color-scheme: light; }
+  .lcars .nav-today { background: var(--lc-blue); padding: 0 16px; }
+  .lcars .nav-btn:not(:disabled):hover { filter: brightness(1.15); }
+  .lcars .figs { color: var(--lc-peach); }
+  .lcars .fig-label { color: var(--lc-lavender); font-size: 0.75rem; }
+  .lcars .tile .kwh { font-size: 0.7rem; margin-top: 0; line-height: 1; }
+  .lcars .tile.past .watts { font-size: 1rem; }
   .lc-fill { flex: 1; min-height: 24px; }
   .lc-main { padding: 6px 2px 10px 18px; min-width: 0; }
 
